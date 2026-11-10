@@ -126,6 +126,14 @@ def search_execution_node(state) -> dict:
             results = _search_brave(query)
         elif search_config.primary == "arxiv":
             results = _search_arxiv(query)
+        elif search_config.primary == "exa+brave":
+            results = _search_exa(query)
+            # If Exa results look low-quality, fall back to Brave
+            if results and _results_look_low_quality(results):
+                print("  [SEARCH] Exa results look low-quality → trying Brave")
+                brave_results = _search_brave(query)
+                if brave_results and len(brave_results) >= len(results):
+                    results = brave_results
         else:
             results = _fallback_search(query)
     except Exception as e:
@@ -296,6 +304,39 @@ def _search_arxiv(query: str) -> list[dict]:
 def _fallback_search(query: str) -> list[dict]:
     """Fallback: return a simple placeholder."""
     return [{"title": f"Search result for: {query}", "url": "", "content": ""}]
+
+
+def _results_look_low_quality(results: list[dict]) -> bool:
+    """Heuristic: detect if search results are likely unhelpful for extraction.
+
+    Low-quality signals:
+    - Most results come from GitHub repos (not narrative content)
+    - Most results have empty or very short content
+    - Few or no results have descriptive content text
+
+    Returns True if results should be replaced with Brave results.
+    """
+    if not results:
+        return True
+    if len(results) < 2:
+        # Too few results to judge; let the normal fallback handle it
+        return False
+
+    n = len(results)
+
+    # Signal 1: Most results are GitHub repos
+    github_count = sum(1 for r in results if "github.com" in r.get("url", "").lower())
+    if github_count > n * 0.6:
+        return True
+
+    # Signal 2: Most results have empty or very short content
+    short_content = sum(
+        1 for r in results if not r.get("content") or len(r.get("content", "")) < 50
+    )
+    if short_content > n * 0.6:
+        return True
+
+    return False
 
 
 # ── Citation discovery via Exa answer API ────────────────────────────

@@ -140,7 +140,8 @@ class LLMConfig:
 class SearchConfig:
     """Search engine configuration."""
 
-    # Provider: "exa", "brave", "arxiv", or a combo (env: SEARCH_PRIMARY)
+    # Provider: "exa", "brave", "arxiv", "exa+brave" (dual-search, prefer narrative)
+    # "exa+brave" runs Exa first, falls back to Brave if Exa results look low-quality
     primary: str = field(default_factory=lambda: os.getenv("SEARCH_PRIMARY", "exa"))
 
     # Exa

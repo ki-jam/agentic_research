@@ -116,6 +116,9 @@ def extract_and_verify_node(state) -> dict:
         primary_source_idx = (
             max(set(source_indices), key=source_indices.count) if source_indices else 0
         )
+        # Clamp to valid range — LLM may reference source indices that don't exist
+        if raw_result_ids:
+            primary_source_idx = min(primary_source_idx, len(raw_result_ids) - 1)
         source_raw_id = raw_result_ids[primary_source_idx] if raw_result_ids else None
 
         # Create knowledge entry (status="raw", can be curated later)
