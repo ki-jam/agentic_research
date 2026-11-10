@@ -88,7 +88,7 @@ class LLMConfig:
 
         # Provider-specific defaults
         provider = self.provider
-        effective_model = model or self._resolve_model(provider)
+        effective_model = model or getattr(self, f"{provider}_model", self.local_model)
         effective_temp = self.temperature
 
         if provider == "anthropic":

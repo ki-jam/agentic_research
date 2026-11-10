@@ -35,8 +35,18 @@ def extract_json(text: str) -> str:
     return text
 
 
-def parse_json(text: str) -> Any:
-    """extract_json + json.loads in one step. Raises on invalid JSON."""
+def parse_json(text: str | Any) -> Any:
+    """extract_json + json.loads in one step. Raises on invalid JSON.
+
+    Handles Anthropic Sonnet 5+ responses where content is a list of blocks
+    (e.g. [{"type": "text", "text": "..."}]) rather than a plain string.
+    """
+    if isinstance(text, list):
+        text = " ".join(
+            b.get("text", "") if isinstance(b, dict) else str(b)
+            for b in text
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
     return json.loads(extract_json(text))
 
 

@@ -295,6 +295,16 @@ def main():
 
         print("\n" + "=" * 60)
         print("Research complete.")
+
+        from utils.cost import get_active_tracker
+
+        tracker = get_active_tracker()
+        if tracker:
+            s = tracker.get_summary()
+            print(f"  Model:    {s['model']}")
+            print(f"  Calls:    {s['total_calls']}")
+            print(f"  In/Out:   {s['input_tokens']:,}/{s['output_tokens']:,} tokens")
+            print(f"  Cost:     ${s['estimated_cost']:.4f}")
         return
 
     # ── New session ─────────────────────────────────────────────
@@ -322,6 +332,21 @@ def main():
         )
         sys.exit(130)
 
+    # ── Cost summary ─────────────────────────────────────────────
+    from utils.cost import get_active_tracker
+
+    tracker = get_active_tracker()
+    if tracker:
+        s = tracker.get_summary()
+        print(f"  Model:    {s['model']}")
+        print(f"  Calls:    {s['total_calls']}")
+        print(f"  In/Out:   {s['input_tokens']:,}/{s['output_tokens']:,} tokens")
+        print(f"  Cost:     ${s['estimated_cost']:.4f}")
+        if s["per_task"]:
+            print("  Per-task:")
+            for task, count in s["per_task"].items():
+                if count > 0:
+                    print(f"    {task}: {count}")
     print("\n" + "=" * 60)
     print("Research complete.")
 
