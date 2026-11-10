@@ -51,9 +51,15 @@ class LLMConfig:
         default_factory=lambda: os.getenv("ANTHROPIC_BASE_URL", "")
     )
 
-    # Shared LLM params
-    temperature: float = field(default_factory=lambda: _default_temperature())
+    # Shared LLM params (overridden by provider defaults at init)
+    temperature: float = 0.3
     max_tokens: int = 16384
+
+    def __post_init__(self):
+        """Apply provider-specific defaults after dataclass init."""
+        defaults = _get_provider_defaults()
+        if "temperature" in defaults:
+            self.temperature = defaults["temperature"]
 
     def get_chat_model(
         self, model: str = "", max_tokens: int | None = None, task: str = ""
@@ -121,27 +127,13 @@ class LLMConfig:
                 max_tokens=max_tokens,
             )
 
-    def _resolve_model(self, provider: str) -> str:
-        """Resolve the default model name for a provider."""
-        if provider == "openai":
-            return self.openai_model
-        elif provider == "anthropic":
-            return self.anthropic_model
-        else:
-            return self.local_model
-
-
-def _default_temperature() -> float:
-    """Return the default temperature based on the current provider.
-
-    Claude Sonnet 5+ only accepts temperature=0 or 1.0.
-    All other providers accept the usual 0.3.
-    """
-    provider = os.getenv("PROVIDER", "local")
-    model = os.getenv("LOCAL_MODEL" if provider == "local" else "ANTHROPIC_MODEL", "")
-    if provider == "anthropic" and "sonnet-5" in model:
-        return 1.0
-    return 0.3
+        return ChatOpenAI(  # fallback
+            model=self.local_model,
+            base_url=self.local_base_url,
+            api_key="not-needed",
+            temperature=self.temperature,
+            max_tokens=max_tokens,
+        )
 
 
 @dataclass(frozen=False)
@@ -222,6 +214,20 @@ class WorkflowConfig:
     summarize_model: str = field(
         default_factory=lambda: os.getenv("SUMMARIZE_MODEL", "")
     )
+
+
+# ── Provider defaults ─────────────────────────────────────────────
+_PROVIDER_DEFAULTS: dict[str, dict] = {
+    "local": {"temperature": 0.3},
+    "openai": {"temperature": 0.3},
+    "anthropic": {"temperature": 1.0},
+}
+
+
+def _get_provider_defaults() -> dict:
+    """Return the default config for the currently selected provider."""
+    provider = os.getenv("PROVIDER", "local")
+    return _PROVIDER_DEFAULTS.get(provider, _PROVIDER_DEFAULTS["local"])
 
 
 # Global config singleton
