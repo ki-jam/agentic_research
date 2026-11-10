@@ -45,11 +45,14 @@ class LLMConfig:
         default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", "")
     )
     anthropic_model: str = field(
-        default_factory=lambda: os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+        default_factory=lambda: os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+    )
+    anthropic_base_url: str = field(
+        default_factory=lambda: os.getenv("ANTHROPIC_BASE_URL", "")
     )
 
     # Shared LLM params
-    temperature: float = 0.3
+    temperature: float = field(default_factory=lambda: _default_temperature())
     max_tokens: int = 16384
 
     def get_chat_model(
@@ -77,34 +80,68 @@ class LLMConfig:
             if task_model:
                 model = task_model
 
-        if self.provider == "openai":
+        # Provider-specific defaults
+        provider = self.provider
+        effective_model = model or self._resolve_model(provider)
+        effective_temp = self.temperature
+
+        if provider == "anthropic":
+            # Claude Sonnet 5+ only accepts temperature=0 or 1.0
+            effective_temp = 1.0 if "sonnet-5" in effective_model else self.temperature
+
+        if provider == "openai":
             from langchain_openai import ChatOpenAI
 
             return ChatOpenAI(
-                model=model or self.openai_model,
+                model=effective_model or self.openai_model,
                 api_key=self.openai_api_key or None,
-                temperature=self.temperature,
+                temperature=effective_temp,
                 max_tokens=max_tokens,
             )
-        elif self.provider == "anthropic":
+        elif provider == "anthropic":
             from langchain_anthropic import ChatAnthropic
 
-            return ChatAnthropic(
-                model=model or self.anthropic_model,
-                api_key=self.anthropic_api_key or None,
-                temperature=self.temperature,
-                max_tokens=max_tokens,
-            )
+            kwargs: dict = {
+                "model": effective_model or self.anthropic_model,
+                "api_key": self.anthropic_api_key or None,
+                "temperature": effective_temp,
+                "max_tokens": max_tokens,
+            }
+            if self.anthropic_base_url:
+                kwargs["anthropic_api_url"] = self.anthropic_base_url
+            return ChatAnthropic(**kwargs)
         else:  # local
             from langchain_openai import ChatOpenAI
 
             return ChatOpenAI(
-                model=model or self.local_model,
+                model=effective_model or self.local_model,
                 base_url=self.local_base_url,
-                api_key="not-needed",  # local servers don't require a key
-                temperature=self.temperature,
+                api_key=os.getenv("LOCAL_API_KEY") or "not-needed",
+                temperature=effective_temp,
                 max_tokens=max_tokens,
             )
+
+    def _resolve_model(self, provider: str) -> str:
+        """Resolve the default model name for a provider."""
+        if provider == "openai":
+            return self.openai_model
+        elif provider == "anthropic":
+            return self.anthropic_model
+        else:
+            return self.local_model
+
+
+def _default_temperature() -> float:
+    """Return the default temperature based on the current provider.
+
+    Claude Sonnet 5+ only accepts temperature=0 or 1.0.
+    All other providers accept the usual 0.3.
+    """
+    provider = os.getenv("PROVIDER", "local")
+    model = os.getenv("LOCAL_MODEL" if provider == "local" else "ANTHROPIC_MODEL", "")
+    if provider == "anthropic" and "sonnet-5" in model:
+        return 1.0
+    return 0.3
 
 
 @dataclass(frozen=False)
