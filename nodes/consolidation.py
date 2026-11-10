@@ -22,7 +22,6 @@ from db.knowledge import (
     all_questions_are_resolved,
     get_plan,
     get_plan_findings,
-    get_pending_questions,
     report_quality_gate,
 )
 from utils.llm import parse_json, invoke_with_cost
@@ -127,7 +126,13 @@ Return ONLY valid JSON:
   "confidence": "high|medium|low"
 }}
 
-Be honest. "ready" should be false if the report would feel thin, incomplete, or superficial.
+IMPORTANT for gaps:
+- Each gap MUST name at least one specific framework/tool by name (e.g., "vLLM", "SGLang", "TGI").
+- Do NOT write gaps about infrastructure tools (Kafka, Kubernetes) unless directly about LLM serving.
+- Do NOT write gaps about quantization libraries unless about serving integration.
+- Do NOT write gaps about model training/fine-tuning.
+- Be specific: "Missing coverage of TGI's KV-cache-aware routing" not "missing details".
+- Be honest. "ready" should be false if the report would feel thin, incomplete, or superficial.
 A good report should help a newcomer understand the topic and its nuances."""
 
         model = config.get_chat_model(task="curation")
@@ -265,8 +270,12 @@ def consolidation_node(state) -> dict:
     # backlog routing in earlier iterations.
     add_to_backlog = route == "manage_backlog" or hit_max_iterations
     if add_to_backlog and not quality["ready"] and quality.get("gaps") and plan_id:
-        # Build set of existing question texts (fuzzy match by keyword overlap)
-        all_qs = get_pending_questions(plan_id) if plan_id else []
+        # Build set of ALL existing question texts for dedup (not just pending)
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT question FROM questions WHERE plan_id = ?", (plan_id,)
+            ).fetchall()
+        all_qs = [dict(r) for r in rows]
         existing_kw = set()
         for q in all_qs:
             for w in q["question"].lower().split():

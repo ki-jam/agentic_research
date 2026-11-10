@@ -50,6 +50,13 @@ Consider:
 - Whether the entry adds new information or duplicates existing findings
 - Actionability — can the reader use this information?
 
+DISCARD entries that:
+- Discuss infrastructure tools (Kafka, Kubernetes, Docker, etc.) without LLM/inference context
+- Discuss quantization libraries without serving/deployment context
+- Are about model training, fine-tuning, or data preprocessing — NOT serving/inference
+- Are about generic deployment patterns without framework-specific technical details
+- Are README links or documentation index pages with no substantive content
+
 Return a JSON array of recommendations for each raw entry:
 [
   {
@@ -62,13 +69,19 @@ Return a JSON array of recommendations for each raw entry:
 
 CURATE_USER = """Research query: "{query}"
 
+Given this specific query, evaluate each entry for relevance:
+- Does it directly address the research topic?
+- Does it discuss concrete frameworks, tools, or techniques (not just infrastructure)?
+- Would a reader use this to answer the research question?
+
 Raw entries found:
 {entries_text}
 
 Extracted findings:
 {findings_text}
 
-Generate recommendations for each raw entry."""
+Generate recommendations for each raw entry.
+"""
 
 # ── Extraction Prompts ──────────────────────────────────────────────
 
@@ -95,6 +108,14 @@ Popularity/authority signal:
 - If a result appears to be from a niche/new/university project (e.g., a small GitHub repo),
   note it but don't give it equal weight to established industry tools.
 - Look for and extract findings about major frameworks even if they're not in the top search results.
+
+DISCARD findings that:
+- Discuss infrastructure tools (Kafka, Kubernetes, Docker, etc.) WITHOUT explicit LLM/inference context
+- Discuss quantization libraries (AMD Quark, AWQ, GPTQ, etc.) WITHOUT serving/deployment context
+- Are about model training, fine-tuning, RL, or data preprocessing — NOT serving/inference
+- Are about generic deployment patterns without framework-specific technical details
+- Name a framework but contain no technical details about it (e.g., just a README link)
+- Are about compression, messaging, or storage WITHOUT connecting to LLM serving
 
 Quality rules (enforced strictly):
 - Every finding must directly address the question. Irrelevant content → skip it.

@@ -73,6 +73,10 @@ Findings:
 Step 1: Identify any pairs of findings that make contradictory claims about the same topic.
 Step 2: For each contradiction, suggest 1-2 specific research questions that would help resolve it.
 
+IMPORTANT: Only flag contradictions about LLM serving/scheduling frameworks.
+Skip contradictions about infrastructure tools (Kafka, Kubernetes), quantization libraries,
+or model training — these are out of scope.
+
 Return ONLY valid JSON — an array:
 [
   {{
