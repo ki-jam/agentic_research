@@ -18,6 +18,9 @@ data/*.db
 data/*.md
 data/reports/
 
+# uv lockfile
+uv.lock
+
 # IDE
 .idea/
 .vscode/
