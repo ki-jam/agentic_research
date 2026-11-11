@@ -44,6 +44,11 @@ class ResearchState(TypedDict, total=False):
     _quality: dict
     _hit_max_iterations: bool
 
+    # Question-bank coverage computed by consolidation (total, closed, open,
+    # high_open) — shown on the review screen and enforced by the coverage
+    # floor gate on auto-stop.
+    _coverage: dict
+
     # Stagnation tracking (set by consolidation, read by the next consolidation)
     _findings_streak: int
     _prev_finding_count: int

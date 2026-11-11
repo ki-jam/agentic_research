@@ -26,6 +26,7 @@ from db.knowledge import (
 )
 from utils.llm import parse_json, invoke_with_cost
 from utils.quality import filter_quality, is_science_topic
+from utils.scope import build_scope_block
 
 
 def _evaluate_readiness(
@@ -65,6 +66,12 @@ def _evaluate_readiness(
 
         plan = get_plan(plan_id)
 
+        # Scope block for this plan (stored at planning time; rebuilt from
+        # the query for plans created before the column existed).
+        scope = (plan.get("scope") or "").strip() or build_scope_block(
+            plan.get("query", original_query)
+        )
+
         # Build a compact representation of all findings
         findings_text = (
             "\n".join(
@@ -97,6 +104,8 @@ def _evaluate_readiness(
 
 Research topic: {original_query}
 
+{scope}
+
 Questions investigated:
 {questions_text}
 
@@ -127,11 +136,10 @@ Return ONLY valid JSON:
 }}
 
 IMPORTANT for gaps:
-- Each gap MUST name at least one specific framework/tool by name (e.g., "vLLM", "SGLang", "TGI").
-- Do NOT write gaps about infrastructure tools (Kafka, Kubernetes) unless directly about LLM serving.
-- Do NOT write gaps about quantization libraries unless about serving integration.
-- Do NOT write gaps about model training/fine-tuning.
-- Be specific: "Missing coverage of TGI's KV-cache-aware routing" not "missing details".
+- Each gap MUST name at least one specific system or angle by name — prefer
+  the named systems listed in the RESEARCH SCOPE block above.
+- Do NOT write gaps about systems or topics outside that scope.
+- Be specific: name the system and the missing aspect, not "missing details".
 - Be honest. "ready" should be false if the report would feel thin, incomplete, or superficial.
 A good report should help a newcomer understand the topic and its nuances."""
 
@@ -203,7 +211,7 @@ def consolidation_node(state) -> dict:
 
     # ── LLM quality evaluation ──────────────────────────────────
     # Pass pre-fetched data via state so _evaluate_readiness avoids
-    # duplicate DB calls (get_plan_findings + _filter_quality).
+    # duplicate DB calls (get_plan_findings + filter_quality).
     quality = _evaluate_readiness(
         state,
         all_findings=all_findings,
@@ -222,6 +230,18 @@ def consolidation_node(state) -> dict:
             "confidence": "low",
             "heuristic": True,
         }
+
+    # ── Coverage floor ───────────────────────────────────────────
+    # "Ready" is an opinion about report quality, not proof the question
+    # bank is covered. A session with open high-priority questions must not
+    # auto-terminate — route to human_review so the user can stop (interim
+    # report) or continue.
+    coverage = (
+        _question_coverage(plan_id)
+        if plan_id
+        else {"total": 0, "closed": 0, "open": 0, "high_open": 0}
+    )
+    coverage_ok = _coverage_floor_ok(coverage)
 
     # ── Decision logic ──────────────────────────────────────────
     review_every = workflow_config.review_every_n_iterations
@@ -246,9 +266,13 @@ def consolidation_node(state) -> dict:
         # No sufficient evidence — route to no-evidence terminal
         route = "write_findings_no_evidence"
     elif quality["ready"] and num_findings >= min_findings:
-        route = "write_findings"
+        # The coverage floor can override an otherwise-ready verdict:
+        # with open questions, the human decides (stop → interim report).
+        route = "write_findings" if coverage_ok else "human_review"
     elif findings_streak >= 3:
-        route = "write_findings"
+        # Stagnation escape hatch — same floor applies, so a stalled
+        # session with an uncovered question bank goes to the human too.
+        route = "write_findings" if coverage_ok else "human_review"
     elif iteration % review_every == 0 and iteration >= review_every:
         route = "human_review"
     else:
@@ -317,12 +341,61 @@ def consolidation_node(state) -> dict:
         "_findings_streak": findings_streak,
         "_prev_finding_count": num_findings,
         "_quality": quality,
+        "_coverage": coverage,
         "_hit_max_iterations": hit_max_iterations if route == "human_review" else False,
         **clear_rewind,
     }
 
 
 # ── Enforcement helpers ────────────────────────────────────────────
+
+
+def _question_coverage(plan_id: str) -> dict:
+    """Question-bank coverage: total, closed, open, high_open.
+
+    "Closed" means terminal (resolved or discarded) — same terminal set as
+    all_questions_are_resolved. Everything else (pending, in_progress,
+    failed) counts as open; failed is deliberately non-terminal, so a
+    failing question keeps the floor closed until it is retried or
+    discarded.
+    """
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT status, priority FROM questions WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchall()
+    except Exception:
+        return {"total": 0, "closed": 0, "open": 0, "high_open": 0}
+    total = len(rows)
+    closed = sum(1 for r in rows if r[0] in ("resolved", "discarded"))
+    high_open = sum(
+        1 for r in rows if r[0] not in ("resolved", "discarded") and r[1] == "high"
+    )
+    return {
+        "total": total,
+        "closed": closed,
+        "open": total - closed,
+        "high_open": high_open,
+    }
+
+
+def _coverage_floor_ok(coverage: dict) -> bool:
+    """Coverage floor for auto-stop.
+
+    Disabled by ready_coverage_gate=False. Otherwise auto-stop requires
+    (a) no open high-priority questions and (b) at least
+    ready_min_resolution of the bank closed. An empty bank passes
+    vacuously (nothing to cover).
+    """
+    if not workflow_config.ready_coverage_gate:
+        return True
+    total = coverage.get("total", 0)
+    if total == 0:
+        return True
+    if coverage.get("high_open", 0) > 0:
+        return False
+    return coverage.get("closed", 0) / total >= workflow_config.ready_min_resolution
 
 
 def _has_actual_search_results(plan_id: str) -> bool:

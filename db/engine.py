@@ -43,6 +43,7 @@ def init_db():
                 query      TEXT NOT NULL,
                 questions  TEXT NOT NULL,
                 thread_id  TEXT,
+                scope      TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -132,6 +133,7 @@ def init_db():
         for migration in (
             "ALTER TABLE plans ADD COLUMN thread_id TEXT",
             "ALTER TABLE questions ADD COLUMN last_error TEXT",
+            "ALTER TABLE plans ADD COLUMN scope TEXT",
         ):
             try:
                 conn.execute(migration)

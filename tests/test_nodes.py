@@ -1053,6 +1053,180 @@ def test_consolidation_evaluation_failure_falls_back_to_heuristic(monkeypatch):
     assert result["_route"] == "write_findings"
 
 
+def _ready_model():
+    class MockModel:
+        def invoke(self, prompt, **kwargs):
+            return type(
+                "R",
+                (),
+                {
+                    "content": json.dumps(
+                        {"ready": True, "gaps": [], "confidence": "high"}
+                    )
+                },
+            )()
+
+    return MockModel()
+
+
+def _seed_ready_plan():
+    """Plan with one resolved question + one real search result + one finding
+    — everything the ready route needs except the coverage floor."""
+    from db.knowledge import (
+        create_finding,
+        create_plan,
+        create_questions,
+        store_raw_result,
+    )
+
+    plan_id = create_plan("Test", [])
+    create_questions(plan_id, [{"question": "Q1", "priority": "high"}])
+    qid = f"q_{plan_id}_0"
+    set_question_resolved(qid)
+    rid = store_raw_result(qid, plan_id, "Q1", "exa", "content", "Title")
+    create_finding(
+        question_id=qid,
+        raw_result_id=rid,
+        knowledge_entry_id=None,
+        facts=[{"claim": "c", "confidence": "high"}],
+        summary="A specific finding about Q1",
+        tags=[],
+    )
+    return plan_id
+
+
+def test_consolidation_coverage_floor_blocks_open_high_priority(monkeypatch):
+    """LLM says ready + enough findings, but a high-priority question is
+    still open → auto-stop is blocked and the session goes to human_review
+    (the user can stop → interim report, or continue)."""
+    from nodes.consolidation import consolidation_node
+    from config import settings
+    from config.settings import workflow_config
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": _ready_model(),
+    )
+    monkeypatch.setattr(workflow_config, "min_findings", 1)
+    plan_id = _seed_ready_plan()
+    # Second, high-priority question left open
+    qid2 = add_question(plan_id, "Q2")
+    update_question_priority(qid2, "high")
+
+    result = consolidation_node({"plan_ref": plan_id, "iteration_count": 1})
+    assert result["_route"] == "human_review"
+    assert result["_coverage"]["total"] == 2
+    assert result["_coverage"]["high_open"] == 1
+
+
+def test_consolidation_coverage_floor_blocks_low_resolution(monkeypatch):
+    """No open high-priority questions, but only 1/3 of the bank is closed
+    (below the 0.5 floor) → auto-stop is blocked."""
+    from nodes.consolidation import consolidation_node
+    from config import settings
+    from config.settings import workflow_config
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": _ready_model(),
+    )
+    monkeypatch.setattr(workflow_config, "min_findings", 1)
+    plan_id = _seed_ready_plan()
+    add_question(plan_id, "Q2")  # medium by default
+    add_question(plan_id, "Q3")  # medium by default
+    # 1 closed of 3 = 0.33 < 0.5
+
+    result = consolidation_node({"plan_ref": plan_id, "iteration_count": 1})
+    assert result["_route"] == "human_review"
+    assert result["_coverage"]["closed"] == 1
+    assert result["_coverage"]["high_open"] == 0
+
+
+def test_consolidation_coverage_floor_passes_at_threshold(monkeypatch):
+    """1/2 closed (== the 0.5 default) with no open high-priority → the
+    ready route proceeds as before."""
+    from nodes.consolidation import consolidation_node
+    from config import settings
+    from config.settings import workflow_config
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": _ready_model(),
+    )
+    monkeypatch.setattr(workflow_config, "min_findings", 1)
+    plan_id = _seed_ready_plan()
+    add_question(plan_id, "Q2")  # medium by default
+    # 1 closed of 2 = 0.5 >= 0.5
+
+    result = consolidation_node({"plan_ref": plan_id, "iteration_count": 1})
+    assert result["_route"] == "write_findings"
+
+
+def test_consolidation_coverage_gate_can_be_disabled(monkeypatch):
+    """READY_COVERAGE_GATE=false restores the pre-gate behavior: open
+    high-priority questions no longer block auto-stop."""
+    from nodes.consolidation import consolidation_node
+    from config import settings
+    from config.settings import workflow_config
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": _ready_model(),
+    )
+    monkeypatch.setattr(workflow_config, "min_findings", 1)
+    monkeypatch.setattr(workflow_config, "ready_coverage_gate", False)
+    plan_id = _seed_ready_plan()
+    qid2 = add_question(plan_id, "Q2")
+    update_question_priority(qid2, "high")
+
+    result = consolidation_node({"plan_ref": plan_id, "iteration_count": 1})
+    assert result["_route"] == "write_findings"
+
+
+def test_readiness_prompt_uses_scope_block(monkeypatch):
+    """The readiness prompt embeds the plan's scope block and no longer
+    hard-codes topic-specific systems (vLLM/SGLang/TGI/Kafka)."""
+    from nodes.consolidation import _evaluate_readiness
+    from config import settings
+    from utils.scope import build_scope_block
+
+    captured = {}
+
+    class CapModel:
+        def invoke(self, prompt, **kwargs):
+            captured["prompt"] = prompt
+            return type(
+                "R",
+                (),
+                {
+                    "content": json.dumps(
+                        {"ready": False, "gaps": [], "confidence": "low"}
+                    )
+                },
+            )()
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": CapModel(),
+    )
+
+    q = "Compare vLLM, SGLang, and TGI for LLM serving"
+    plan_id = create_plan(q, [], scope=build_scope_block(q))
+    _evaluate_readiness({"plan_ref": plan_id, "original_query": q})
+
+    prompt = captured["prompt"]
+    assert "RESEARCH SCOPE (enforced):" in prompt
+    assert "Named systems in scope: vLLM, SGLang, TGI" in prompt
+    # The hard-coded topic rules are gone (no system names in the rules)
+    assert "Kafka" not in prompt
+    assert '"vLLM", "SGLang", "TGI"' not in prompt
+
+
 def test_consolidation_clears_rewind_flag_after_one_pass(monkeypatch):
     """Regression (P0-1): _rewind_from must be consumed by consolidation.
 
@@ -1839,6 +2013,7 @@ def test_workflow_state_declares_control_keys():
         "_human_response",
         "_quality",
         "_hit_max_iterations",
+        "_coverage",
         "_findings_streak",
         "_prev_finding_count",
         "_stats_display",
@@ -1854,9 +2029,16 @@ def test_workflow_state_declares_control_keys():
 
 
 class MockLLM:
-    """Scripted LLM — dispatches on prompt content, never touches the network."""
+    """Scripted LLM — dispatches on prompt content, never touches the network.
+
+    prompts: class-level record of every prompt received (shared across
+    per-call instances) so tests can assert what the graph actually sent.
+    """
+
+    prompts: list = []
 
     def invoke(self, prompt: str):
+        MockLLM.prompts.append(prompt)
         if "focused, searchable sub-questions" in prompt:
             content = json.dumps(
                 [
@@ -1964,6 +2146,7 @@ def test_e2e_review_interrupt_then_stop(e2e_env, monkeypatch):
     app = build_app(MemorySaver())
     thread = "e2e-scenario-1"
     cfg = {"configurable": {"thread_id": thread}}
+    MockLLM.prompts.clear()
     initial = {
         "original_query": "E2E research topic alpha",
         "questions": [
@@ -1975,6 +2158,15 @@ def test_e2e_review_interrupt_then_stop(e2e_env, monkeypatch):
     payload = _stream(app, initial, cfg)
     assert payload is not None, "graph should suspend at the iteration-1 review"
     assert "How would you like to proceed?" in payload["prompt"]
+    # Coverage floor: the question bank's state is visible on the review
+    # screen (1 resolved, 1 pending at this point)
+    assert "Question coverage: 1/2 closed" in payload["prompt"]
+
+    # Scope guard: the extraction, readiness, and curation prompts all
+    # received the deterministic scope block for this query
+    scope_prompts = [p for p in MockLLM.prompts if "RESEARCH SCOPE (enforced):" in p]
+    assert len(scope_prompts) >= 3
+    assert all('Topic: "E2E research topic alpha"' in p for p in scope_prompts)
 
     payload2 = _stream(app, Command(resume="stop"), cfg)
     assert payload2 is None, "graph should finish after 'stop'"
@@ -1991,6 +2183,11 @@ def test_e2e_review_interrupt_then_stop(e2e_env, monkeypatch):
     assert "E2E research topic alpha" in report
     assert "- [x] What is the core mechanism? — resolved" in report
     assert "- [ ] What are the trade-offs? — pending" in report
+
+    # Interim labeling: the trade-offs question is still pending, so the
+    # report must be explicitly a snapshot (top banner + stats line)
+    assert "**Interim report** — 1 of 2 sub-questions are still open" in report
+    assert "Open questions: 1 of 2" in report
 
     plan_ref = state.values["plan_ref"]
     with get_db() as conn:
@@ -2362,6 +2559,57 @@ def test_cost_tracker_unknown_model_costs_zero():
     t.record_call("report", "some-local-model", 500, 250)
     assert t.get_estimated_cost() == 0.0
     assert t.get_summary()["model"] == "some-local-model"
+
+
+def test_cost_tracker_mixed_models_priced_per_model():
+    """A session that mixes models (e.g. an Anthropic research loop + a
+    local report-writing process) must be priced per model, and the footer
+    must show the mix — not attribute everything to the last model seen."""
+    from utils.cost import CostTracker
+
+    t = CostTracker()
+    # Anthropic loop: 1M in / 100k out on claude-sonnet-5-5 ($3/$15 per M)
+    t.record_call("extraction", "claude-sonnet-5-5", 1_000_000, 100_000)
+    # Local report: 1M in / 100k out on qwen36_35 ($0)
+    t.record_call("report", "qwen36_35", 1_000_000, 100_000)
+
+    # Only the Anthropic tokens cost anything: 3.00 + 1.50
+    assert t.get_estimated_cost() == 4.50
+
+    s = t.get_summary()
+    # Last-model field is kept for backward compat...
+    assert s["model"] == "qwen36_35"
+    # ...but the per-model breakdown shows both
+    assert set(s["models"]) == {"claude-sonnet-5-5", "qwen36_35"}
+    assert s["models"]["claude-sonnet-5-5"]["cost"] == 4.50
+    assert s["models"]["qwen36_35"]["cost"] == 0.0
+    assert s["models"]["qwen36_35"]["priced"] is True
+
+    footer = t.format_footer(label="Plan: plan_test123")
+    assert "Plan: plan_test123" in footer
+    assert "claude-sonnet-5-5" in footer and "qwen36_35" in footer
+    assert "per-model pricing" in footer
+    assert "$4.5000" in footer
+
+
+def test_cost_footer_flags_unknown_model_and_unrecorded_calls():
+    """Unknown models are $0 but flagged (not silent); calls without usage
+    metadata are counted and reported in the footer."""
+    from utils.cost import CostTracker
+
+    t = CostTracker()
+    t.record_call("report", "mystery-model-9000", 500, 250)
+    t.note_unrecorded()
+    t.note_unrecorded()
+
+    assert t.get_estimated_cost() == 0.0
+    s = t.get_summary()
+    assert s["models"]["mystery-model-9000"]["priced"] is False
+    assert s["unrecorded_calls"] == 2
+
+    footer = t.format_footer()
+    assert "not in pricing table" in footer
+    assert "2 call(s) had no usage metadata" in footer
 
 
 def test_invoke_with_cost_records_to_active_tracker():

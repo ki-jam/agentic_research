@@ -21,17 +21,25 @@ except ImportError:
 # ── Plan operations ──────────────────────────────────────────────────
 
 
-def create_plan(query: str, questions: List[dict], thread_id: str = "") -> str:
+def create_plan(
+    query: str, questions: List[dict], thread_id: str = "", scope: str = ""
+) -> str:
     """Create a research plan and return its ID.
 
     IDs are uuid4-based (not hash-based) so they are stable across processes
     and cannot collide.
+
+    scope: deterministic scope block (utils.scope.build_scope_block) derived
+    from the query — stored on the plan row so curation/extraction/readiness
+    prompts can anchor DISCARD/gap rules to THIS topic instead of hard-coded
+    examples.
     """
     plan_id = f"plan_{uuid.uuid4().hex[:8]}"
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO plans (id, query, questions, thread_id, created_at) VALUES (?, ?, ?, ?, ?)",
-            (plan_id, query, _serialize(questions), thread_id, _now()),
+            "INSERT INTO plans (id, query, questions, thread_id, scope, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (plan_id, query, _serialize(questions), thread_id, scope, _now()),
         )
     return plan_id
 
@@ -226,44 +234,9 @@ def deduplicate_and_prioritize(plan_id: str) -> None:
     if len(rows) < 2:
         return  # nothing to dedup
 
-    # Extract key words from a question (remove common stop words)
-    STOP_WORDS = {
-        "what",
-        "is",
-        "are",
-        "was",
-        "were",
-        "how",
-        "do",
-        "does",
-        "did",
-        "the",
-        "a",
-        "an",
-        "in",
-        "on",
-        "at",
-        "to",
-        "for",
-        "of",
-        "with",
-        "about",
-        "that",
-        "this",
-        "it",
-        "and",
-        "or",
-        "but",
-        "not",
-        "no",
-        "can",
-        "will",
-        "would",
-        "should",
-        "could",
-        "been",
-        "being",
-    }
+    # Stop words: the shared module-level STOP_WORDS (defined below,
+    # resolved at call time) — one list for all keyword extraction, so
+    # question dedup and plan-similarity can't drift apart.
 
     def normalize_word(w: str) -> str:
         """Normalize a word: lowercase, strip punctuation, remove hyphens, drop trailing 's'."""
@@ -695,6 +668,10 @@ def get_stats() -> Dict:
 
 # ── Pre-flight: find similar active plans ──────────────────────────
 
+# Generic English stop words only — shared by question dedup
+# (deduplicate_and_prioritize) and plan-similarity (_normalize_words).
+# No topic-specific words: a word like "support" is meaningful in
+# "TGI supports GPU offloading" and must stay a keyword.
 STOP_WORDS = {
     "what",
     "is",
@@ -731,18 +708,6 @@ STOP_WORDS = {
     "could",
     "been",
     "being",
-    "looking",
-    "forward",
-    "prices",
-    "capacities",
-    "help",
-    "like",
-    "support",
-    "approaching",
-    "way",
-    "sustainable",
-    "best",
-    "ideas",
 }
 
 
@@ -874,10 +839,10 @@ def report_quality_gate(plan_id: str) -> dict:
         return {"ok": False, "reason": "no plan", "stats": {}}
 
     try:
-        from nodes.curation import _filter_quality
+        from utils.quality import filter_quality
 
         all_findings = get_plan_findings(plan_id)
-        valid_findings, discarded = _filter_quality(all_findings)
+        valid_findings, discarded = filter_quality(all_findings)
 
         with get_db() as conn:
             # Count unique sources (raw results with non-citation engines)

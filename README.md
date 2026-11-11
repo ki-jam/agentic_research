@@ -4,21 +4,11 @@ A cyclical research agent built with LangGraph that plans, searches, extracts, a
 
 ## Quick Start
 
-### Using uv (recommended)
-
-```bash
-# Install uv if you don't have it: https://docs.astral.sh/uv/
-cd research_agent
-
-uv sync          # installs dependencies + dev tools
-uv run pytest    # run tests
-uv run ruff .    # lint & format
-```
-
-### Using pip
-
 ```bash
 cd research_agent
+
+# Install dependencies
+pip install -r requirements.txt
 
 # Activate the venv
 source ../venv/bin/activate  # or: ./venv/bin/activate from parent dir
@@ -65,9 +55,11 @@ consolidation → write_findings → END
 
 Each research iteration picks the highest-priority open question, searches for it (cache-aware), extracts structured findings, and consolidates progress. The loop exits when:
 
-- the LLM readiness check says the research is **ready** (all questions resolved, enough findings), or
+- the LLM readiness check says the research is **ready** (enough findings) **and** the coverage floor is met (no open high-priority questions, and at least `READY_MIN_RESOLUTION` of the question bank closed), or
 - **max iterations** is reached (interim analysis screen), or
 - the curator types **`stop`** at a periodic or interim review.
+
+When the readiness check passes but the coverage floor does not, the session goes to a human review instead of stopping silently — the curator can type `stop` for an explicitly labeled **interim report** (banner + open-question count in the stats) or `continue` to keep researching.
 
 Quality gaps from the readiness check are promoted back into the question bank, so the loop can actually address them instead of spinning. Gaps are added both during backlog routing (when the loop continues) and at max iterations (before the interim analysis screen).
 
@@ -80,6 +72,7 @@ Quality gaps from the readiness check are promoted back into the question bank, 
 - **Multi-engine search** — Exa (primary; switch via `SEARCH_PRIMARY`), ArXiv (auto-triggered for science terms), citation discovery (Exa answer API, toggleable)
 - **SQLite knowledge base** — plans, questions, raw results, findings, curated entries, and reports, all plan-scoped
 - **Quality filter** — shared `utils/quality.py` module; generic filler findings are discarded and tracked
+- **Scope guards** — every plan stores a deterministic scope block (`utils/scope.py`) derived from its own query; the extraction, curation, and readiness prompts anchor their DISCARD/gap rules to that block instead of hard-coded examples, so any topic gets topic-specific off-topic filtering
 - **Failure recovery** — extraction errors mark questions `failed` (non-terminal); `retry <id>` resets them for re-processing, or `accept <id>` resolves them with a placeholder finding that records the gap
 - **Evidence Matrix** — per-source coverage stats shown at reviews to surface under-represented sources
 - **Pre-flight plan matching** — before creating a new plan, the agent checks for similar active plans (Jaccard keyword similarity, threshold 0.25) and warns the user to avoid duplication. Use `--plan-id` to continue an existing plan instead.
@@ -125,7 +118,7 @@ Environment variables (or `.env` in this directory):
 | `LOCAL_MODEL` | `qwen36_35` | Local model name |
 | `LOCAL_BASE_URL` | `http://localhost:8080/v1` | Local API endpoint |
 | `OPENAI_API_KEY` / `OPENAI_MODEL` | — / `gpt-4o` | OpenAI credentials |
-| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | — / `claude-sonnet-4-20250514` | Anthropic credentials |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | — / `claude-sonnet-5-5` | Anthropic credentials |
 | `EXA_API_KEY` | — | Exa search API key |
 | `BRAVE_API_KEY` | — | Brave Search API key |
 | `SEARCH_PRIMARY` | `exa` | Primary search engine (`exa`, `brave`, or `arxiv`) |
@@ -134,6 +127,8 @@ Environment variables (or `.env` in this directory):
 | `MAX_ITERATIONS` | `10` | Loop budget before interim analysis |
 | `REVIEW_EVERY` | `5` | Pause for human review every N iterations |
 | `MIN_FINDINGS` | `3` | Minimum valid findings required for the ready check |
+| `READY_COVERAGE_GATE` | `true` | Block auto-stop when the coverage floor is unmet (see `READY_MIN_RESOLUTION`) |
+| `READY_MIN_RESOLUTION` | `0.5` | Minimum fraction of the question bank that must be closed (resolved/discarded) for auto-stop; any open high-priority question blocks regardless |
 | `REFINE_QUERY_THRESHOLD` | `20` | Queries shorter than this (chars) skip LLM refinement |
 | `PLANNING_MODEL` / `EXTRACTION_MODEL` / `CURATION_MODEL` / `REPORT_MODEL` / `SUMMARIZE_MODEL` | *(provider default)* | Per-stage model overrides |
 | `RESEARCH_BASE_DIR` | `research_agent/data` | Data directory (DB, checkpoints, reports) |
@@ -152,7 +147,7 @@ SQLite at `data/knowledge.db` (7 tables):
 | `curated_findings` | Structured findings per question | Facts with confidence, summary, tags |
 | `reports` | Final reports | Also written to a timestamped `.md` file in `data/` |
 
-Pre-existing databases are migrated in place on startup (`ALTER TABLE` guards add `plans.thread_id` and `questions.last_error`).
+Pre-existing databases are migrated in place on startup (`ALTER TABLE` guards add `plans.thread_id`, `questions.last_error`, and `plans.scope`).
 
 ## File Structure
 
@@ -174,11 +169,15 @@ research_agent/
 │   ├── consolidation.py    # Progress assessment + DoD check + routing
 │   └── curation.py         # Review analysis + interrupt + curation commands
 ├── utils/
-│   ├── cost.py             # LLM cost tracking (per-app tracker + active slot)
+│   ├── cost.py             # LLM cost tracking (per-app tracker + active slot, per-model pricing)
+│   ├── citations.py        # Citation validation + deterministic references-section rebuild
 │   ├── llm.py              # Shared JSON extraction/parsing for LLM output
-│   └── quality.py          # Finding quality filter + science-topic detection
+│   ├── quality.py          # Finding quality filter + science-topic detection
+│   └── scope.py            # Deterministic scope block (query → DISCARD-rule anchor)
 ├── graph/workflow.py       # LangGraph StateGraph assembly + build_app()
 ├── tests/test_nodes.py     # Test suite (scripted LLMs, no network)
+├── tests/test_citations.py # Citation validation/repair tests
+├── tests/test_scope.py     # Scope-guard tests (entities, persistence, prompt wiring)
 ├── run.py                  # CLI execution script
 └── data/                   # knowledge.db, checkpoints.db, report .md files
 ```

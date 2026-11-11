@@ -51,10 +51,10 @@ Consider:
 - Actionability — can the reader use this information?
 
 DISCARD entries that:
-- Discuss infrastructure tools (Kafka, Kubernetes, Docker, etc.) without LLM/inference context
-- Discuss quantization libraries without serving/deployment context
-- Are about model training, fine-tuning, or data preprocessing — NOT serving/inference
-- Are about generic deployment patterns without framework-specific technical details
+- Fall outside the RESEARCH SCOPE block in the user prompt (different
+  systems or topics not connected to the research topic)
+- Are about adjacent but distinct activities rather than the topic itself
+- Are about generic patterns without framework-specific technical details
 - Are README links or documentation index pages with no substantive content
 
 Return a JSON array of recommendations for each raw entry:
@@ -68,6 +68,8 @@ Return a JSON array of recommendations for each raw entry:
 """
 
 CURATE_USER = """Research query: "{query}"
+
+{scope}
 
 Given this specific query, evaluate each entry for relevance:
 - Does it directly address the research topic?
@@ -103,19 +105,18 @@ Required structure (in order):
 4. Trade-offs — pros, cons, limitations, failure modes
 
 Popularity/authority signal:
-- Prioritize well-known, established frameworks (TVM, MLIR, IREE, XLA, TorchInductor,
-  oneAPI, ONNX Runtime, Triton, ROCm, CUDA, Metal, etc.)
+- Prioritize well-known, established frameworks and tools over niche or
+  very new projects.
 - If a result appears to be from a niche/new/university project (e.g., a small GitHub repo),
   note it but don't give it equal weight to established industry tools.
 - Look for and extract findings about major frameworks even if they're not in the top search results.
 
 DISCARD findings that:
-- Discuss infrastructure tools (Kafka, Kubernetes, Docker, etc.) WITHOUT explicit LLM/inference context
-- Discuss quantization libraries (AMD Quark, AWQ, GPTQ, etc.) WITHOUT serving/deployment context
-- Are about model training, fine-tuning, RL, or data preprocessing — NOT serving/inference
-- Are about generic deployment patterns without framework-specific technical details
+- Fall outside the RESEARCH SCOPE block in the user prompt (different
+  systems or topics not connected to the research question)
+- Are about adjacent but distinct activities rather than the topic itself
+- Are about generic patterns without framework-specific technical details
 - Name a framework but contain no technical details about it (e.g., just a README link)
-- Are about compression, messaging, or storage WITHOUT connecting to LLM serving
 
 Quality rules (enforced strictly):
 - Every finding must directly address the question. Irrelevant content → skip it.
@@ -154,6 +155,8 @@ Return ONLY valid JSON — an array of findings:
 
 EXTRACTION_USER = """Research question to answer: "{question}"
 
+{scope}
+
 Content to analyze:
 ---
 {context}
@@ -182,6 +185,10 @@ Rules:
 - Keep the tone professional and objective
 - Use markdown formatting for readability
 - Do NOT write a "Research Question" section — it is added automatically.
+- Each finding has a "Source: [n]" line. Cite THAT number for claims derived
+  from that finding — do not assign a claim to a different source.
+- Do NOT write a "References", "Sources", or "Bibliography" section — the
+  numbered reference list is added automatically after your report.
 
 Do NOT fabricate facts. Only use the provided curated entries."""
 
@@ -198,9 +205,12 @@ These come from the Exa answer API which identified authoritative papers on the 
 TREAT THESE AS HIGH-PRIORITY SOURCES — they are often the most authoritative references.
 Ensure they are referenced and integrated into the report.
 
-References (source URLs from search, arXiv, and local documents):
+References (source URLs from search, arXiv, and local documents) — cite using
+exactly these numbers:
 {references}
 
 Write a comprehensive research report. Include inline citations like [1], [2] etc.
-to reference the sources above. Do NOT fabricate facts — only use the provided findings.
+using ONLY the numbers listed above (each finding's "Source: [n]" line tells you
+which number to cite for its claims). Do NOT fabricate facts — only use the
+provided findings.
 """

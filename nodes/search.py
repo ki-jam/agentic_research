@@ -302,8 +302,14 @@ def _search_arxiv(query: str) -> list[dict]:
 
 
 def _fallback_search(query: str) -> list[dict]:
-    """Fallback: return a simple placeholder."""
-    return [{"title": f"Search result for: {query}", "url": "", "content": ""}]
+    """Unknown search primary → no results.
+
+    Returning [] (instead of a placeholder row) matters: a fake result
+    would be stored in raw_results and presented to extraction as if it
+    were real data. With [], the caller's fallback chain (Brave/arXiv)
+    engages, and a genuine no-results state stays honest.
+    """
+    return []
 
 
 def _results_look_low_quality(results: list[dict]) -> bool:

@@ -82,9 +82,14 @@ def invoke_with_cost(model, prompt, task: str = "unknown") -> Any:
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
 
+    tracker = get_active_tracker()
     if input_tokens or output_tokens:
-        tracker = get_active_tracker()
         if tracker is not None:
             tracker.record_call(task, model_name, input_tokens, output_tokens)
+    elif tracker is not None:
+        # Some providers/servers don't return usage metadata. Count the
+        # call so the footer can report "N calls not counted" instead of
+        # silently under-reporting the session's activity.
+        tracker.note_unrecorded()
 
     return response

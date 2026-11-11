@@ -57,7 +57,7 @@ class LLMConfig:
 
     def __post_init__(self):
         """Apply provider-specific defaults after dataclass init."""
-        defaults = _get_provider_defaults()
+        defaults = _get_provider_defaults(self.provider)
         if "temperature" in defaults:
             self.temperature = defaults["temperature"]
 
@@ -126,14 +126,6 @@ class LLMConfig:
                 temperature=effective_temp,
                 max_tokens=max_tokens,
             )
-
-        return ChatOpenAI(  # fallback
-            model=self.local_model,
-            base_url=self.local_base_url,
-            api_key="not-needed",
-            temperature=self.temperature,
-            max_tokens=max_tokens,
-        )
 
 
 @dataclass(frozen=False)
@@ -205,6 +197,22 @@ class WorkflowConfig:
         default_factory=lambda: int(os.getenv("REFINE_QUERY_THRESHOLD", "20"))
     )
 
+    # Ready-gate / coverage floor: the readiness LLM's "ready" verdict is an
+    # opinion about report quality, not proof that the question bank is
+    # covered. When the gate is enabled, auto-stop (write_findings) is
+    # blocked if any high-priority question is still open, or if the
+    # closed/total ratio (resolved+discarded counts as closed) is below
+    # ready_min_resolution — the session routes to human_review instead, so
+    # the user can stop (interim report) or continue.
+    ready_coverage_gate: bool = field(
+        default_factory=lambda: (
+            os.getenv("READY_COVERAGE_GATE", "true").lower() == "true"
+        )
+    )
+    ready_min_resolution: float = field(
+        default_factory=lambda: float(os.getenv("READY_MIN_RESOLUTION", "0.5"))
+    )
+
     # Per-step model overrides (empty = use main config model)
     extraction_model: str = field(
         default_factory=lambda: os.getenv("EXTRACTION_MODEL", "")
@@ -225,9 +233,14 @@ _PROVIDER_DEFAULTS: dict[str, dict] = {
 }
 
 
-def _get_provider_defaults() -> dict:
-    """Return the default config for the currently selected provider."""
-    provider = os.getenv("PROVIDER", "local")
+def _get_provider_defaults(provider: str | None = None) -> dict:
+    """Return the default config for a provider.
+
+    Takes the provider explicitly (callers pass ``self.provider``) so the
+    result follows the configured instance rather than re-reading the
+    PROVIDER env var, which can diverge after update_config().
+    """
+    provider = provider or os.getenv("PROVIDER", "local")
     return _PROVIDER_DEFAULTS.get(provider, _PROVIDER_DEFAULTS["local"])
 
 

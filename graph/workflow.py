@@ -78,6 +78,25 @@ def _insert_after_first_heading(text: str, section: str) -> str:
     return section + "\n" + text  # no heading at all: prepend
 
 
+def conn_qcounts(plan_id: str) -> tuple:
+    """(total, open) question counts for a plan.
+
+    "Open" = non-terminal (pending/in_progress/failed) — same semantics
+    as the consolidation coverage floor, so the banner, the stats line,
+    and the gate agree on what counts as unresolved.
+    """
+    from db.engine import get_db
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN status NOT IN ('resolved', 'discarded') THEN 1 ELSE 0 END) "
+            "FROM questions WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+    return (row[0] or 0, row[1] or 0)
+
+
 # ── Node: Write Final Report ──────────────────────────────────────
 
 
@@ -113,6 +132,7 @@ def _write_findings_node(state) -> dict:
     # Replaces the old N+1 loop: one SELECT engine WHERE id=? per finding.
     sources = set()
     engine_map: dict[int, str] = {}
+    raw_id_to_url: dict[int, str] = {}
     with get_db() as conn:
         rows = conn.execute(
             "SELECT DISTINCT source_url, title FROM raw_results WHERE plan_id = ?",
@@ -125,15 +145,18 @@ def _write_findings_node(state) -> dict:
             if url:
                 sources.add((url, title))
 
-        # Batch engine lookup (N+1 → 1 query)
+        # Batch engine + URL lookup (N+1 → 1 query). The URL per raw result
+        # lets each finding show its canonical reference number below.
         raw_ids = [f["raw_result_id"] for f in findings if f.get("raw_result_id")]
         if raw_ids:
             placeholders = ",".join("?" for _ in raw_ids)
             for row in conn.execute(
-                f"SELECT id, engine FROM raw_results WHERE id IN ({placeholders})",
+                f"SELECT id, engine, source_url FROM raw_results WHERE id IN ({placeholders})",
                 raw_ids,
             ):
                 engine_map[row[0]] = row[1]
+                if row[2]:
+                    raw_id_to_url[row[0]] = row[2]
 
     # Also add sources from curated knowledge entries
     for entry in curated:
@@ -144,6 +167,13 @@ def _write_findings_node(state) -> dict:
 
     # Sort sources for consistent ordering
     sources_list = sorted(sources, key=lambda x: x[0])
+
+    # raw_result_id → canonical reference number, so every finding block
+    # shows the exact [n] it came from. Without this the report LLM has to
+    # guess which reference belongs to which finding — the observed cause
+    # of misattributed citations (claims cited to an unrelated source).
+    url_to_refnum = {url: i for i, (url, _t) in enumerate(sources_list, 1)}
+    raw_id_to_refnum = {rid: url_to_refnum[url] for rid, url in raw_id_to_url.items()}
 
     # ── Separate citation discovery findings from search findings ──
     citation_findings = []
@@ -169,7 +199,9 @@ def _write_findings_node(state) -> dict:
         curated_text += f"### {entry.get('title', 'Untitled')}\n"
         curated_text += f"Tags: {', '.join(entry.get('topic_tags', []))}\n"
         curated_text += f"Summary: {entry.get('summary', '')}\n"
-        curated_text += f"Source: {entry.get('source_url', 'N/A')}\n\n"
+        entry_ref = url_to_refnum.get(entry.get("source_url", ""))
+        ref_note = f"[{entry_ref}] " if entry_ref else ""
+        curated_text += f"Source: {ref_note}{entry.get('source_url', 'N/A')}\n\n"
 
     # Build search findings text
     search_findings_text = ""
@@ -188,6 +220,11 @@ def _write_findings_node(state) -> dict:
         tags = f.get("tags", [])
         if isinstance(tags, list):
             search_findings_text += f"Tags: {', '.join(tags)}\n"
+        refnum = raw_id_to_refnum.get(f.get("raw_result_id"))
+        if refnum:
+            search_findings_text += (
+                f"Source: [{refnum}] — cite this number for claims from this finding\n"
+            )
         search_findings_text += "\n"
 
     # Build citation discovery findings text (prominently labeled)
@@ -208,6 +245,9 @@ def _write_findings_node(state) -> dict:
             tags = f.get("tags", [])
             if isinstance(tags, list):
                 citation_findings_text += f"Tags: {', '.join(tags)}\n"
+            refnum = raw_id_to_refnum.get(f.get("raw_result_id"))
+            if refnum:
+                citation_findings_text += f"Source: [{refnum}] — cite this number for claims from this finding\n"
             citation_findings_text += "\n"
 
     findings_text = search_findings_text + citation_findings_text + curated_text
@@ -315,27 +355,54 @@ def _write_findings_node(state) -> dict:
     # The LLM rephrases the query into a title and may never restate it,
     # so insert it deterministically (verbatim query + sub-question
     # status) — this is also what makes partial coverage visible.
+    total_questions, open_questions = (0, 0)
     if plan_id:
+        # Question-bank counts for the interim banner + stats line.
+        total_questions, open_questions = conn_qcounts(plan_id)
+
         question_section = build_question_section(plan_id, query)
         if question_section:
             report_text = _insert_after_first_heading(report_text, question_section)
+
+        # Interim banner: when questions are still open, the report is a
+        # snapshot, not a settled answer — say so at the top. Inserted after
+        # the question section so it lands directly under the title.
+        if open_questions:
+            banner = (
+                f"> **Interim report** — {open_questions} of {total_questions} "
+                "sub-questions are still open. This report reflects what is "
+                "known so far; the open questions are listed below.\n"
+            )
+            report_text = _insert_after_first_heading(report_text, banner)
+
+    # ── Citation validation & repair ─────────────────────────────
+    # The LLM may write its own References section with numbers that don't
+    # match the canonical list it was given. Rebuild that section from the
+    # canonical source list (deterministic, idempotent) and report citation
+    # health in the Research Stats block below.
+    from utils.citations import validate_citations, citation_stats_line
+
+    report_text, citation_stats = validate_citations(report_text, sources_list)
 
     # ── Cache & knowledge stats ──────────────────────────────────
     with get_db() as conn:
         cache_hits = conn.execute("SELECT COUNT(*) FROM search_cache").fetchone()[0]
 
     # ── Cost summary (if tracker is available) ────────────────────
+    # Label the footer with the plan so the numbers can be attributed to a
+    # session — the tracker is per-process, and resumed/continued plans run
+    # in fresh processes (a bare "Model:" line used to be ambiguous).
     cost_tracker = get_active_tracker()
-    cost_footer = cost_tracker.format_footer() if cost_tracker else ""
+    cost_footer = (
+        cost_tracker.format_footer(label=f"  Plan: {plan_id}")
+        if cost_tracker and plan_id
+        else (cost_tracker.format_footer() if cost_tracker else "")
+    )
 
-    # Insert Evidence Matrix before research stats (if LLM report exists, insert after it)
+    # Append the Evidence Matrix after the report body (and after the
+    # rebuilt References section), before the Research Stats block.
     if evidence_matrix_text:
-        if report_text and not report_text.strip().startswith("# Research Report:"):
-            # LLM-generated report — insert Evidence Matrix before the Research Question section
-            report_text = report_text.rstrip() + "\n\n" + evidence_matrix_text
-        else:
-            # Fallback or empty report — add Evidence Matrix
-            report_text += evidence_matrix_text
+        report_text = report_text.rstrip() + "\n\n" + evidence_matrix_text
 
     stats_text = (
         "\n\n--- Research Stats ---\n"
@@ -343,6 +410,8 @@ def _write_findings_node(state) -> dict:
         f"  Valid findings: {len(valid_findings)}\n"
         f"  Discarded (generic): {len(discarded)}\n"
         f"  Curated knowledge entries: {len(curated)}\n"
+        f"  Open questions: {open_questions} of {total_questions}\n"
+        + citation_stats_line(citation_stats)
     )
     report_text += stats_text
 

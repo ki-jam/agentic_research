@@ -25,12 +25,10 @@ from db.knowledge import (
     deduplicate_and_prioritize,
 )
 from db.engine import get_db
+from nodes.consolidation import _coverage_floor_ok
 from utils.llm import parse_json, invoke_with_cost
 from utils.quality import filter_quality
-
-
-# Backward-compatible alias for code that still imports `_filter_quality`
-_filter_quality = filter_quality
+from utils.scope import scope_for_plan
 
 
 # ── Contradiction detector ────────────────────────────────────────
@@ -150,6 +148,7 @@ def _generate_curation_recommendations(state, raw_entries, findings) -> list:
 
         prompt = CURATE_USER.format(
             query=state.get("original_query", ""),
+            scope=scope_for_plan(state.get("plan_ref", "")),
             entries_text=entries_text,
             findings_text=findings_text,
         )
@@ -180,6 +179,23 @@ def _build_interim_prompt(
 ) -> str:
     """Build the prompt shown to the user — interim analysis or regular review."""
     lines = ["How would you like to proceed?"]
+
+    # Question-bank coverage (set by consolidation). When the coverage
+    # floor blocks auto-stop, say so explicitly — "stop" still works and
+    # writes an interim report.
+    coverage = state.get("_coverage") or {}
+    if coverage.get("total"):
+        lines.append(
+            f"  Question coverage: {coverage.get('closed', 0)}/"
+            f"{coverage.get('total', 0)} closed "
+            f"({coverage.get('open', 0)} open, "
+            f"{coverage.get('high_open', 0)} high-priority)"
+        )
+        if coverage.get("open", 0) > 0 and not _coverage_floor_ok(coverage):
+            lines.append(
+                '    Auto-stop is blocked — "stop" writes an interim report, '
+                '"continue" keeps researching.'
+            )
 
     if hit_max:
         lines.append("")
@@ -273,7 +289,7 @@ def prepare_review_node(state) -> dict:
     all_findings = get_plan_findings(plan_id) if plan_id else []
 
     # ── Quality filter ──
-    valid_findings, discarded_findings = _filter_quality(all_findings)
+    valid_findings, discarded_findings = filter_quality(all_findings)
 
     # ── Contradiction detection ──
     contradictions, contradiction_questions = _detect_contradictions(
@@ -404,7 +420,7 @@ def curate_knowledge_node(state) -> dict:
     if response == "findings":
         plan_id = state.get("plan_ref")
         all_findings = get_plan_findings(plan_id) if plan_id else []
-        valid, discarded = _filter_quality(all_findings)
+        valid, discarded = filter_quality(all_findings)
         contradictions, cq = _detect_contradictions(valid, plan_id)
         return {
             "_human_response": None,
@@ -419,7 +435,7 @@ def curate_knowledge_node(state) -> dict:
 
     if response == "contradictions":
         plan_id = state.get("plan_ref")
-        valid, _ = _filter_quality(get_plan_findings(plan_id) if plan_id else [])
+        valid, _ = filter_quality(get_plan_findings(plan_id) if plan_id else [])
         contradictions, cq = _detect_contradictions(valid, plan_id)
         return {
             "_human_response": None,

@@ -45,6 +45,39 @@ def resolve_thread_id(ref: str) -> str:
     return ref
 
 
+def _print_cost_summary():
+    """Print the session cost summary (per-model, per-task)."""
+    from utils.cost import get_active_tracker
+
+    tracker = get_active_tracker()
+    if not tracker:
+        return
+    s = tracker.get_summary()
+    models = s["models"]
+    if len(models) <= 1:
+        for model, m in models.items():
+            note = "" if m["priced"] else " (not in pricing table)"
+            print(f"  Model:    {model}{note}")
+    else:
+        print("  Models:   (priced per model)")
+        for model, m in models.items():
+            print(
+                f"            {model}: {m['calls']} call(s), "
+                f"{m['input_tokens']:,}/{m['output_tokens']:,} tokens, "
+                f"${m['cost']:.4f}"
+            )
+    print(f"  Calls:    {s['total_calls']}")
+    print(f"  In/Out:   {s['input_tokens']:,}/{s['output_tokens']:,} tokens")
+    print(f"  Cost:     ${s['estimated_cost']:.4f}")
+    if s["per_task"]:
+        print("  Per-task:")
+        for task, count in s["per_task"].items():
+            if count > 0:
+                print(f"    {task}: {count}")
+    if s["unrecorded_calls"]:
+        print(f"  Note: {s['unrecorded_calls']} call(s) had no usage metadata")
+
+
 def _print_review_screen(payload):
     """Render a review/interrupt payload for the user."""
     if not isinstance(payload, dict):
@@ -73,6 +106,18 @@ def _print_review_screen(payload):
     n_contra = len(payload.get("contradictions") or [])
     if n_contra:
         print(f"  Contradictions: {n_contra} pair(s) flagged")
+    recs = payload.get("recommendations") or []
+    if recs:
+        print("  Curation recommendations:")
+        for r in recs[:10]:
+            reason = f" — {r.get('reason', '')[:80]}" if r.get("reason") else ""
+            print(f"    [{r.get('action', '?'):>7}] {r.get('id', '?')}{reason}")
+    raws = payload.get("raw_entries") or []
+    if raws:
+        print("  Raw entries (curate <id> / discard <id>):")
+        for e in raws[:10]:
+            tags = f" ({', '.join(e.get('tags', []))})" if e.get("tags") else ""
+            print(f"    {e.get('id', '?')}: {e.get('title', 'Untitled')[:60]}{tags}")
     if payload.get("prompt"):
         print()
         print(payload["prompt"])
@@ -233,12 +278,9 @@ def main():
             print(f"No session found for '{args.resume}'. Start a new run instead.")
             sys.exit(1)
 
-        # ── Rewind mode ───────────────────────────────────────
-        # REMOVED: CLI --rewind was dead code (get_state doesn't accept a
-        # nested checkpoint_id config; list_state_history doesn't exist in
-        # this LangGraph version). The in-chat 'rewind' command is the real
-        # feature — see P0-1 fix in consolidation.py.
-
+        # (Rewinding to an older checkpoint is only available in-chat via
+        # the 'rewind' command; this LangGraph version's get_state doesn't
+        # accept nested checkpoint configs for a CLI flag.)
         print(f"Resuming session: {thread_id}")
         try:
             if state.next:
@@ -295,16 +337,7 @@ def main():
 
         print("\n" + "=" * 60)
         print("Research complete.")
-
-        from utils.cost import get_active_tracker
-
-        tracker = get_active_tracker()
-        if tracker:
-            s = tracker.get_summary()
-            print(f"  Model:    {s['model']}")
-            print(f"  Calls:    {s['total_calls']}")
-            print(f"  In/Out:   {s['input_tokens']:,}/{s['output_tokens']:,} tokens")
-            print(f"  Cost:     ${s['estimated_cost']:.4f}")
+        _print_cost_summary()
         return
 
     # ── New session ─────────────────────────────────────────────
@@ -332,21 +365,7 @@ def main():
         )
         sys.exit(130)
 
-    # ── Cost summary ─────────────────────────────────────────────
-    from utils.cost import get_active_tracker
-
-    tracker = get_active_tracker()
-    if tracker:
-        s = tracker.get_summary()
-        print(f"  Model:    {s['model']}")
-        print(f"  Calls:    {s['total_calls']}")
-        print(f"  In/Out:   {s['input_tokens']:,}/{s['output_tokens']:,} tokens")
-        print(f"  Cost:     ${s['estimated_cost']:.4f}")
-        if s["per_task"]:
-            print("  Per-task:")
-            for task, count in s["per_task"].items():
-                if count > 0:
-                    print(f"    {task}: {count}")
+    _print_cost_summary()
     print("\n" + "=" * 60)
     print("Research complete.")
 

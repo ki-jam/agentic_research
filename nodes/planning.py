@@ -11,6 +11,7 @@ from config.prompts import REFINE_SYSTEM, REFINE_USER
 from config.settings import config, workflow_config
 from db.knowledge import create_plan, create_questions
 from utils.llm import parse_json, invoke_with_cost
+from utils.scope import build_scope_block
 
 
 def make_plan_node(state, config=None) -> dict:
@@ -52,6 +53,9 @@ def make_plan_node(state, config=None) -> dict:
         query=state["original_query"],
         questions=questions,
         thread_id=thread_id,
+        # Deterministic scope block (no LLM call) — anchors the DISCARD/gap
+        # rules in the curation/extraction/readiness prompts to this topic.
+        scope=build_scope_block(state["original_query"]),
     )
     create_questions(plan_id, questions)
 

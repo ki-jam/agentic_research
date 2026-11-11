@@ -18,6 +18,7 @@ from db.knowledge import (
     create_knowledge_entry,
 )
 from utils.llm import parse_json, invoke_with_cost
+from utils.scope import scope_for_plan
 
 
 def extract_and_verify_node(state) -> dict:
@@ -166,6 +167,7 @@ def _extract_findings(state, question: dict, context: str) -> tuple[list, str | 
     try:
         prompt = EXTRACTION_USER.format(
             question=question["question"],
+            scope=scope_for_plan(state.get("plan_ref", "")),
             context=context,
         )
 
