@@ -237,24 +237,33 @@ breaks calls, tokens, and $ out per model.
 
 ## How it works
 
-```
-START → make_plan → manage_backlog → search_execution → extract_and_verify → consolidation
-                  ↑                                              |
-                  └──────────── loop (next question) ───────────┤
-                                                                ↓
-                                    prepare_review (analysis) → human_review (interrupt)
-                                                                ↓
-                                                          curate_knowledge
-                                                                ↓ (back to consolidation, loop)
-                                                                ↓
-consolidation → write_findings → END
-               → write_findings_no_evidence → END
-                (when the definition of done is met, the curator types "stop" at a review,
-                 or the quality gate finds no reliable findings)
+```mermaid
+flowchart TD
+    start([START]) --> make_plan["make_plan<br/>refine the query, build the question bank"]
+    make_plan --> backlog["manage_backlog<br/>pick the next open question"]
+    backlog --> search["search_execution<br/>web + arXiv + GitHub (cache-aware)"]
+    search --> extract["extract_and_verify<br/>structured findings"]
+    extract --> consol["consolidation<br/>progress, readiness, quality gate"]
+
+    consol -->|"keep researching · rewind"| backlog
+    consol -->|"review pause · max iterations"| review["prepare_review<br/>analysis (computed once)"]
+    consol -->|"research ready"| report["write_findings<br/>two-pass final report"]
+    consol -->|"no reliable evidence"| noev["write_findings_no_evidence"]
+
+    review --> you{{"human review<br/>the session pauses — continue / stop / curate"}}
+    you --> curate["curate_knowledge<br/>apply your commands"]
+    curate -->|"continue"| consol
+    curate -->|"stop"| report
+
+    report --> fin(["END — report saved to data/ + knowledge base"])
+    noev --> fin
 ```
 
 Each iteration picks the highest-priority open question, searches for it
 (cache-aware), extracts structured findings, and consolidates progress.
+If the research is ready but the question bank isn't fully resolved, the
+session goes to a human review (interim report) instead of stopping
+silently — `stop` there writes the report anyway.
 Notable behaviors:
 
 - **Multi-engine search, routed per question** — Exa/Brave web search,
