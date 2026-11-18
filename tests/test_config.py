@@ -168,6 +168,44 @@ class TestEffectiveConfigBanner:
         assert "local/local-default (all steps)" in out
         assert "search:" in out
 
+    def test_warns_when_local_endpoint_unreachable(self, capsys):
+        # The fixture pins local_base_url to a dead loopback port, so a
+        # session that would otherwise degrade silently gets a warning.
+        import run as run_mod
+
+        run_mod._print_effective_config()
+        out = capsys.readouterr().out
+        assert "not reachable" in out
+        assert "127.0.0.1:9" in out
+
+    def test_no_warning_when_endpoint_reachable(self, capsys, monkeypatch):
+        import run as run_mod
+
+        monkeypatch.setattr(
+            run_mod, "_local_endpoint_reachable", lambda url, timeout=2.0: True
+        )
+        run_mod._print_effective_config()
+        out = capsys.readouterr().out
+        assert "not reachable" not in out
+
+    def test_no_probe_when_no_step_uses_local(self, capsys, monkeypatch):
+        # All steps overridden to a cloud provider → the dead local
+        # endpoint is never hit, so no probe and no warning.
+        import run as run_mod
+
+        for step in STEPS:
+            monkeypatch.setattr(workflow_config, f"{step}_provider", "openai")
+        probed: list[str] = []
+        monkeypatch.setattr(
+            run_mod,
+            "_local_endpoint_reachable",
+            lambda url, timeout=2.0: probed.append(url) or True,
+        )
+        run_mod._print_effective_config()
+        out = capsys.readouterr().out
+        assert not probed
+        assert "not reachable" not in out
+
     def test_overrides_are_listed(self, capsys, monkeypatch):
         import run as run_mod
 

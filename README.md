@@ -18,26 +18,33 @@ Requires Python 3.10+.
 
 ```bash
 cd research_agent
-python3 -m venv venv && source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# Configure: pick a provider, add your keys
+# Configure: copy the template, then open .env in your editor and fill in
+# your keys (every setting is documented in the comments)
 cp .env.example .env
-$EDITOR .env
 ```
 
 You need:
 
-- **One LLM** — a local model (llama.cpp / Ollama) and/or an OpenAI or
-  Anthropic API key
-- **One search key** — Exa and/or Brave. (ArXiv and GitHub search work
-  without keys, just rate-limited.)
+- **One LLM** — either a local model server (llama.cpp / Ollama) **or** an
+  OpenAI / Anthropic API key. Set `PROVIDER` in `.env` to match (the default
+  is `local`) — the session-start banner confirms which model is actually
+  active, and warns if a local endpoint isn't running.
+- **One search key** — Exa (exa.ai) and/or Brave (brave.com/search/api).
+  If your key is Brave's, also set `SEARCH_PRIMARY=brave` (the default is
+  `exa`). ArXiv and GitHub search work without keys, just rate-limited.
 
 Then run your first session:
 
 ```bash
 python run.py ask "The future of micro-frontends in 2026"
 ```
+
+Expect a few minutes: each iteration searches, extracts, and logs its
+progress, and the session pauses at review screens where you decide what
+happens next (continue / stop / curate).
 
 `python run.py` with no arguments opens the interactive menu instead.
 API keys and workflow settings come from `.env` or environment variables —
@@ -80,11 +87,14 @@ python run.py ask "your query" --plan-id plan_abc123        # continue an existi
    file in `data/` and in the knowledge base. Read it any time with
    `python run.py report`.
 
-The session ends when the readiness check says the research is done *and*
-the question bank is sufficiently resolved, when the iteration budget
-(`MAX_ITERATIONS`, default 10) runs out, or when you type `stop` at a
-review. If readiness passes but the question bank isn't resolved enough,
-you get a review screen (interim report) instead of a silent stop.
+The session ends on its own when the readiness check says the research is
+done *and* the question bank is sufficiently resolved, or when you type
+`stop` at a review (which writes the report). When the iteration budget
+(`MAX_ITERATIONS`, default 10) runs out, the session pauses at a review
+screen instead of stopping silently — `stop` writes the report, `continue`
+keeps researching. The same happens if readiness passes but the question
+bank isn't resolved enough: you get a review screen (interim report), not
+a silent stop.
 
 ### Review commands
 
@@ -210,7 +220,7 @@ All settings are environment variables (or `.env` in this directory —
 | `ENABLE_CITATION_DISCOVERY` | `true` | Use the Exa answer API to find foundational papers |
 | `SEARCH_CACHE_TTL_DAYS` | `30` | Lifetime of cached search results (0 = never expires) |
 | `BROWSER_SEARCH_ENABLED` | `false` | Browser-based content enrichment (requires Playwright) |
-| `MAX_ITERATIONS` | `10` | Loop budget before interim analysis |
+| `MAX_ITERATIONS` | `10` | Total iteration budget; when it runs out the session pauses at a review (`stop` → report, `continue` → keep researching) |
 | `REVIEW_EVERY` | `5` | Pause for human review every N iterations |
 | `MIN_FINDINGS` | `3` | Minimum valid findings required for the ready check |
 | `READY_COVERAGE_GATE` | `true` | Block auto-stop when the coverage floor is unmet |

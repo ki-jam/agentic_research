@@ -160,13 +160,33 @@ def _print_cost_summary():
         print(f"  Note: {s['unrecorded_calls']} call(s) had no usage metadata")
 
 
+def _local_endpoint_reachable(base_url: str, timeout: float = 2.0) -> bool:
+    """Liveness check for a local LLM endpoint (GET /models).
+
+    llama.cpp and Ollama both expose the OpenAI-compatible /models route,
+    so one probe covers both. Lets the banner warn *before* a session that
+    would otherwise degrade silently (planning falls back to a single
+    question, extractions all fail) and burn search API quota.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            base_url.rstrip("/") + "/models", timeout=timeout
+        ) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
 def _print_effective_config() -> None:
     """Show which model each step runs on and which search engines are active.
 
     The config is env-var-driven and otherwise silent, so a new user cannot
     tell what is about to run. This banner makes the session log
-    self-explanatory, and it resolves every step so an invalid
-    *_PROVIDER value fails at startup instead of mid-session.
+    self-explanatory, it resolves every step so an invalid
+    *_PROVIDER value fails at startup instead of mid-session, and it warns
+    if a configured local model endpoint is not reachable.
     """
     print(theme.section("Effective config"))
     try:
@@ -194,6 +214,26 @@ def _print_effective_config() -> None:
         f"    search:     primary={search_config.primary}  arxiv={search_config.force_arxiv}  "
         f"github={search_config.force_github}  citations={citations}  cache={cache}"
     )
+
+    # Warn early if any step runs on a local model whose endpoint is not
+    # reachable — otherwise the session degrades silently (planning falls
+    # back to a single question, every extraction fails) and burns search
+    # quota on a run that cannot produce findings. Every LLM call resolves
+    # through one of the four steps, so the resolved providers are the
+    # complete set of endpoints that will be hit.
+    local_steps = [
+        s
+        for s in ("planning", "extraction", "curation", "report")
+        if resolve_step_model(s)[0] == "local"
+    ]
+    if local_steps and not _local_endpoint_reachable(config.local_base_url):
+        print(
+            theme.red(
+                f"  ⚠ local model endpoint {config.local_base_url} is not "
+                "reachable — start your llama.cpp/Ollama server, or set "
+                "PROVIDER=openai / anthropic in .env."
+            )
+        )
 
 
 def _print_curation_output(updates: dict):
