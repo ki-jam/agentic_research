@@ -25,7 +25,7 @@ from db.knowledge import (
     deduplicate_and_prioritize,
 )
 from db.engine import get_db
-from nodes.consolidation import _coverage_floor_ok
+from nodes.consolidation import _coverage_floor_ok, _question_coverage
 from utils.llm import parse_json, invoke_with_cost
 from utils.quality import filter_quality
 from utils.scope import scope_for_plan
@@ -124,6 +124,169 @@ If no contradictions, return []."""
     return [], []
 
 
+# ── LLM-assisted question dedup ───────────────────────────────────
+
+
+def _llm_dedup_open_questions(plan_id: str) -> list[dict]:
+    """LLM-assisted duplicate detection for open (pending) questions.
+
+    Complements the keyword-based deduplicate_and_prioritize(): Jaccard
+    word overlap (>= 0.4) only catches near-verbatim paraphrases, and it
+    only compares pending-to-pending. This pass batches the open
+    questions plus the recently resolved ones (context) into one LLM
+    call and asks for open questions that ask for the same information
+    as another open question or as a question the plan already answered
+    — the observed backlog-growth mode (re-asking a just-resolved
+    question under different words).
+
+    Discards follow the same logic as the keyword pass: the duplicate
+    row becomes status='discarded', priority='low', discovered_by=
+    'llm-dedup' (traceable; revivable with 'retry <id>' on the review
+    screen).
+
+    Safety rails (the local model is flaky):
+    - only question IDs present in the prompt can ever be discarded
+    - a group where the LLM flags every member against each other keeps
+      its best question (union-find over the discard graph)
+    - any failure (LLM down, bad JSON, no duplicates) → no changes, []
+
+    Returns [{"id", "question", "duplicate_of", "reason"}, ...] for the
+    rows actually discarded, for the review screen.
+    """
+    try:
+        with get_db() as conn:
+            open_rows = conn.execute(
+                """SELECT id, question, priority, created_at FROM questions
+                   WHERE plan_id = ? AND status = 'pending'
+                   ORDER BY created_at""",
+                (plan_id,),
+            ).fetchall()
+            resolved_rows = conn.execute(
+                """SELECT id, question FROM questions
+                   WHERE plan_id = ? AND status = 'resolved'
+                   ORDER BY created_at DESC LIMIT 40""",
+                (plan_id,),
+            ).fetchall()
+
+        if len(open_rows) < 2:
+            return []
+
+        open_by_id = {r["id"]: dict(r) for r in open_rows}
+        resolved_ids = {r["id"] for r in resolved_rows}
+
+        open_text = "\n".join(f"- id: {r['id']} — {r['question']}" for r in open_rows)
+        resolved_text = (
+            "\n".join(f"- id: {r['id']} — {r['question']}" for r in resolved_rows)
+            or "(none)"
+        )
+
+        prompt = f"""You are deduplicating a list of open research questions.
+
+OPEN questions:
+{open_text}
+
+ALREADY ANSWERED (resolved) questions, for reference:
+{resolved_text}
+
+Two questions are duplicates if they ask for the same information, even if worded differently.
+
+Return ONLY valid JSON:
+{{"discard": [
+  {{"id": "<open question id>", "duplicate_of": "<id of the question it duplicates, open or answered>", "reason": "<one short clause>"}}
+]}}
+
+Rules:
+- "id" MUST be an OPEN question id from the list above.
+- "duplicate_of" MUST be an id from either list.
+- Only discard an open question if it is genuinely a duplicate.
+- If there are no duplicates, return {{"discard": []}}."""
+
+        model = config.get_chat_model(task="curation")
+        response = invoke_with_cost(model, prompt, task="curation")
+        data = parse_json(response.content)
+        entries = data.get("discard", []) if isinstance(data, dict) else []
+        if not isinstance(entries, list):
+            entries = []
+
+        # Validate against the real bank rows — the LLM may hallucinate ids.
+        parent = {qid: qid for qid in open_by_id}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        anchored_resolved: set[str] = set()
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            qid = e.get("id")
+            dup_of = e.get("duplicate_of")
+            if qid not in open_by_id:
+                continue
+            if dup_of in open_by_id:
+                parent[find(qid)] = find(dup_of)
+            elif dup_of in resolved_ids:
+                anchored_resolved.add(find(qid))
+
+        # Decide discards per component: anchored to a resolved question →
+        # discard every member; otherwise keep the best (priority, then age).
+        components: dict[str, list[str]] = {}
+        for qid in open_by_id:
+            components.setdefault(find(qid), []).append(qid)
+
+        to_discard: set[str] = set()
+        for root, members in components.items():
+            if root in anchored_resolved or any(
+                m in anchored_resolved for m in members
+            ):
+                to_discard.update(members)
+                continue
+            if len(members) > 1:
+                priority_order = {"high": 0, "medium": 1, "low": 2}
+                members.sort(
+                    key=lambda q: (
+                        priority_order.get(open_by_id[q]["priority"], 1),
+                        open_by_id[q]["created_at"],
+                        q,
+                    )
+                )
+                to_discard.update(members[1:])
+
+        if not to_discard:
+            return []
+
+        # Keep the LLM's duplicate_of/reason for each discarded row.
+        meta = {}
+        for e in entries:
+            if isinstance(e, dict) and e.get("id") in to_discard:
+                meta[e["id"]] = {
+                    "duplicate_of": e.get("duplicate_of", ""),
+                    "reason": str(e.get("reason", ""))[:120],
+                }
+
+        with get_db() as conn:
+            for qid in sorted(to_discard):
+                conn.execute(
+                    "UPDATE questions SET status = 'discarded', priority = 'low', "
+                    "discovered_by = 'llm-dedup' WHERE id = ?",
+                    (qid,),
+                )
+
+        return [
+            {
+                "id": qid,
+                "question": open_by_id[qid]["question"],
+                **meta.get(qid, {"duplicate_of": "", "reason": ""}),
+            }
+            for qid in sorted(to_discard)
+        ]
+    except Exception:
+        # Dedup must never block the review — fall back to the keyword pass only.
+        return []
+
+
 # ── Curation recommendations ──────────────────────────────────────
 
 
@@ -176,8 +339,16 @@ def _build_interim_prompt(
     open_questions,
     quality,
     hit_max,
+    llm_dedup=None,
 ) -> str:
-    """Build the prompt shown to the user — interim analysis or regular review."""
+    """Build the analysis text shown on the review screen.
+
+    Only the context-dependent analysis lives here (coverage, interim
+    stats, gaps, contradiction notes). The open-question list and the
+    command reference are rendered by the review screen itself
+    (ui/review.py) from the rest of the payload, so the prompt stays
+    short.
+    """
     lines = ["How would you like to proceed?"]
 
     # Question-bank coverage (set by consolidation). When the coverage
@@ -197,6 +368,14 @@ def _build_interim_prompt(
                 '"continue" keeps researching.'
             )
 
+    if llm_dedup:
+        lines.append(
+            f"  LLM dedup: {len(llm_dedup)} duplicate question(s) discarded "
+            "this review (revive one with 'retry <id>'):"
+        )
+        for d in llm_dedup:
+            lines.append(f"    - {d['question'][:80]} (dup of {d['duplicate_of']})")
+
     if hit_max:
         lines.append("")
         lines.append("  === INTERIM ANALYSIS (max iterations reached) ===")
@@ -209,31 +388,6 @@ def _build_interim_prompt(
             lines.append("  Identified gaps:")
             for gap in quality["gaps"]:
                 lines.append(f"    - {gap}")
-        if open_questions:
-            lines.append("")
-            lines.append("  Open questions (pending + failed):")
-            for q in open_questions[:5]:
-                if q.get("status") == "failed":
-                    err = (q.get("last_error") or "")[:50]
-                    lines.append(f"    [FAILED] {q['question'][:70]}  ({err})")
-                else:
-                    lines.append(f"    [{q['priority']:>6}] {q['question'][:70]}")
-        lines.append("")
-        lines.append("  Options:")
-        lines.append('    - "continue"       → Skip curation, continue research')
-        lines.append(
-            '    - "stop"           → End research, write final report with references'
-        )
-        lines.append(
-            '    - "gap <n>"        → Add gap #n as a question and investigate'
-        )
-        lines.append('    - "curate <id>"    → Promote entry to library')
-        lines.append('    - "discard <id>"   → Remove entry')
-        lines.append('    - "tag <id> <t>"   → Add topic tags')
-        lines.append('    - "findings"       → Show all extracted findings')
-        lines.append('    - "contradictions" → Show all flagged contradictions')
-        lines.append('    - "rewind <seq>"   → Rewind to checkpoint sequence N')
-        lines.append('    - "stats"          → Full database stats')
     else:
         lines.append("")
         lines.append(
@@ -247,21 +401,6 @@ def _build_interim_prompt(
             lines.append("  Suggested questions from contradictions:")
             for q in contradiction_questions:
                 lines.append(f"    - {q}")
-        lines.append("")
-        lines.append("  Options:")
-        lines.append('    - "continue"       → Skip curation, continue research')
-        lines.append('    - "curate <id>"    → Promote entry to library (curated)')
-        lines.append('    - "discard <id>"   → Remove entry')
-        lines.append('    - "tag <id> <t>"   → Add topic tags')
-        lines.append(
-            '    - "findings"       → Show all extracted findings (including discarded)'
-        )
-        lines.append('    - "contradictions" → Show all flagged contradictions')
-        lines.append('    - "rewind <seq>"   → Rewind to checkpoint sequence N')
-        lines.append(
-            '    - "stop"           → End research, write final report with references'
-        )
-        lines.append('    - "stats"          → Full database stats')
 
     return "\n".join(lines)
 
@@ -272,7 +411,8 @@ def prepare_review_node(state) -> dict:
     Runs once per review; the payload is checkpointed in state
     (_review_payload). The interrupt lives in a separate node
     (human_review_interrupt), so on resume LangGraph re-runs only the thin
-    interrupt node — this analysis (dedup + two LLM calls) is not repeated.
+    interrupt node — this analysis (dedup + up to three LLM calls) is not
+    repeated.
 
     At max iterations, presents an interim analysis with prioritized next steps.
     """
@@ -281,8 +421,19 @@ def prepare_review_node(state) -> dict:
     hit_max = state.get("_hit_max_iterations", False)
 
     # ── Dedup + prioritize ──
+    # Two layers: keyword Jaccard (cheap, near-verbatim), then one LLM call
+    # for semantic duplicates — including re-asks of already-resolved
+    # questions, which the keyword pass never sees.
+    llm_dedup = []
     if plan_id:
         deduplicate_and_prioritize(plan_id)
+        llm_dedup = _llm_dedup_open_questions(plan_id)
+        if llm_dedup:
+            # The LLM dedup discarded questions after consolidation
+            # computed the coverage snapshot — refresh it so the review
+            # screen's "Question coverage" line matches the question
+            # stats line (both post-dedup).
+            state["_coverage"] = _question_coverage(plan_id)
 
     # Plan-scoped data (the global versions leak other plans' findings)
     raw_entries = get_plan_entries(plan_id, status="raw") if plan_id else []
@@ -337,6 +488,7 @@ def prepare_review_node(state) -> dict:
         open_questions,
         quality,
         hit_max,
+        llm_dedup,
     )
 
     review_data = {
@@ -348,6 +500,7 @@ def prepare_review_node(state) -> dict:
         "findings_discarded": len(discarded_findings),
         "contradictions": contradictions,
         "contradiction_questions": contradiction_questions,
+        "llm_dedup": llm_dedup,
         "open_questions": open_questions[:10],
         "quality": quality,
         "recommendations": [

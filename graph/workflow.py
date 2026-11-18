@@ -35,6 +35,12 @@ from utils.llm import invoke_with_cost
 
 # ── Report helpers ────────────────────────────────────────────────
 
+# Pass-1 findings cap for the two-pass report. The local 7B model cannot
+# finish a report synthesized from a large findings dump (both attempts
+# failed live on 87 findings while 25-76 synthesized), so pass 1 works
+# from at most this many findings and pass 2 merges in the rest.
+REPORT_PASS1_FINDINGS = 25
+
 
 def build_question_section(plan_id: str, query: str) -> str:
     """Deterministic 'Research Question' section for the final report.
@@ -97,12 +103,39 @@ def conn_qcounts(plan_id: str) -> tuple:
     return (row[0] or 0, row[1] or 0)
 
 
+def build_followup_section(plan_id: str) -> str:
+    """Deterministic 'Suggested Follow-Up Questions' backstop for the report.
+
+    Lists the plan's open (non-terminal) questions as suggested follow-ups,
+    mirroring build_question_section. Returns "" when nothing is open — the
+    LLM's own section (required by REPORT_SYSTEM) then stands alone, and
+    code must not fabricate questions.
+    """
+    from db.engine import get_db
+
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT question FROM questions WHERE plan_id = ? "
+            "AND status NOT IN ('resolved', 'discarded') "
+            "ORDER BY created_at, id",
+            (plan_id,),
+        ).fetchall()
+    if not rows:
+        return ""
+    lines = ["## Suggested Follow-Up Questions", ""]
+    lines.append("Open questions from this session that still need research:")
+    lines.append("")
+    for row in rows:
+        lines.append(f"- {row[0]}")
+    return "\n".join(lines) + "\n"
+
+
 # ── Node: Write Final Report ──────────────────────────────────────
 
 
 def _write_findings_node(state) -> dict:
     """Compile final report from THIS PLAN's DB findings and curated knowledge."""
-    from config.prompts import REPORT_SYSTEM, REPORT_USER
+    from config.prompts import REPORT_PASS2, REPORT_SYSTEM, REPORT_USER
     from config.settings import config
     from db.engine import get_db
     from db.knowledge import (
@@ -175,16 +208,6 @@ def _write_findings_node(state) -> dict:
     url_to_refnum = {url: i for i, (url, _t) in enumerate(sources_list, 1)}
     raw_id_to_refnum = {rid: url_to_refnum[url] for rid, url in raw_id_to_url.items()}
 
-    # ── Separate citation discovery findings from search findings ──
-    citation_findings = []
-    search_findings = []
-    for f in findings:
-        raw_id = f.get("raw_result_id")
-        if raw_id and engine_map.get(raw_id, "").startswith("exa-answer"):
-            citation_findings.append(f)
-        else:
-            search_findings.append(f)
-
     # Build references section
     references_text = ""
     if sources_list:
@@ -203,54 +226,67 @@ def _write_findings_node(state) -> dict:
         ref_note = f"[{entry_ref}] " if entry_ref else ""
         curated_text += f"Source: {ref_note}{entry.get('source_url', 'N/A')}\n\n"
 
-    # Build search findings text
-    search_findings_text = ""
-    for f in search_findings:
-        search_findings_text += f"### Finding: {f.get('summary', 'Untitled')}\n"
-        search_findings_text += f"Q: {f.get('source_question', 'N/A')}\n"
-        facts = f.get("facts", [])
-        if isinstance(facts, list):
-            for fact in facts:
-                if isinstance(fact, dict):
-                    search_findings_text += (
-                        f"- {fact.get('claim', '')} ({fact.get('confidence', '?')})\n"
-                    )
-                else:
-                    search_findings_text += f"- {fact}\n"
-        tags = f.get("tags", [])
-        if isinstance(tags, list):
-            search_findings_text += f"Tags: {', '.join(tags)}\n"
-        refnum = raw_id_to_refnum.get(f.get("raw_result_id"))
-        if refnum:
-            search_findings_text += (
-                f"Source: [{refnum}] — cite this number for claims from this finding\n"
-            )
-        search_findings_text += "\n"
+    # ── Findings text builder (shared by both report passes) ───────
+    def _findings_block(subset: list) -> str:
+        """Render findings in the report format: search findings first,
+        then the prominently-labeled citation-discovery section."""
 
-    # Build citation discovery findings text (prominently labeled)
-    citation_findings_text = ""
-    if citation_findings:
-        citation_findings_text += "### 📚 FOUNDATIONAL PAPERS (Citation Discovery)\n"
-        citation_findings_text += "These findings come from the Exa answer API, which identified foundational/authoritative papers on the topic.\n\n"
-        for f in citation_findings:
-            citation_findings_text += f"### Finding: {f.get('summary', 'Untitled')}\n"
-            citation_findings_text += f"Q: {f.get('source_question', 'N/A')}\n"
+        def _is_citation(f) -> bool:
+            rid = f.get("raw_result_id")
+            return bool(rid and engine_map.get(rid, "").startswith("exa-answer"))
+
+        def _finding_lines(f) -> str:
+            out = f"### Finding: {f.get('summary', 'Untitled')}\n"
+            out += f"Q: {f.get('source_question', 'N/A')}\n"
             facts = f.get("facts", [])
             if isinstance(facts, list):
                 for fact in facts:
                     if isinstance(fact, dict):
-                        citation_findings_text += f"- {fact.get('claim', '')} ({fact.get('confidence', '?')})\n"
+                        out += f"- {fact.get('claim', '')} ({fact.get('confidence', '?')})\n"
                     else:
-                        citation_findings_text += f"- {fact}\n"
+                        out += f"- {fact}\n"
             tags = f.get("tags", [])
             if isinstance(tags, list):
-                citation_findings_text += f"Tags: {', '.join(tags)}\n"
+                out += f"Tags: {', '.join(tags)}\n"
             refnum = raw_id_to_refnum.get(f.get("raw_result_id"))
             if refnum:
-                citation_findings_text += f"Source: [{refnum}] — cite this number for claims from this finding\n"
-            citation_findings_text += "\n"
+                out += f"Source: [{refnum}] — cite this number for claims from this finding\n"
+            return out + "\n"
 
-    findings_text = search_findings_text + citation_findings_text + curated_text
+        text = "".join(_finding_lines(f) for f in subset if not _is_citation(f))
+        cites = [f for f in subset if _is_citation(f)]
+        if cites:
+            text += "### 📚 FOUNDATIONAL PAPERS (Citation Discovery)\n"
+            text += "These findings come from the Exa answer API, which identified foundational/authoritative papers on the topic.\n\n"
+            text += "".join(_finding_lines(f) for f in cites)
+        return text
+
+    # Full text — the deterministic fallback embeds EVERYTHING, uncut.
+    findings_text = _findings_block(findings) + curated_text
+
+    # ── Two-pass split ─────────────────────────────────────────────
+    # Pass 1 synthesizes from a capped, prioritized set; pass 2 merges
+    # the remaining findings into the pass-1 report. Selection order:
+    # citation-discovery findings first (the report prompt treats them
+    # as high-priority sources), then question priority (high → medium
+    # → low); ties keep DB order (newest first).
+    priority_of: dict[str, int] = {}
+    with get_db() as conn:
+        for row in conn.execute(
+            "SELECT id, priority FROM questions WHERE plan_id = ?", (plan_id,)
+        ):
+            priority_of[row[0]] = {"high": 0, "medium": 1, "low": 2}.get(row[1], 1)
+
+    def _rank(f):
+        rid = f.get("raw_result_id")
+        is_cite = bool(rid and engine_map.get(rid, "").startswith("exa-answer"))
+        return (0 if is_cite else 1, priority_of.get(f.get("question_id"), 1))
+
+    ranked = sorted(findings, key=_rank)
+    pass1_findings = ranked[:REPORT_PASS1_FINDINGS]
+    pass2_findings = ranked[REPORT_PASS1_FINDINGS:]
+    pass1_findings_text = _findings_block(pass1_findings) + curated_text
+    pass2_findings_text = _findings_block(pass2_findings)
 
     questions_text = ""
     if plan:
@@ -266,42 +302,118 @@ def _write_findings_node(state) -> dict:
         except (json.JSONDecodeError, AttributeError):
             pass
 
-    # Try LLM-generated report
-    try:
-        # The report is the longest LLM call in the pipeline. Thinking models
-        # can spend the entire default token budget on reasoning and return an
-        # empty answer (observed live on plan_d3df337a), so it gets its own
-        # larger output budget.
+    # ── LLM report synthesis (two passes) ───────────────────────────
+    # The local 7B model fails on the full findings text at large plans
+    # (3 of 6 live sessions: OpenAIAPIError / too-short body, correlated
+    # with prompt size — see RESEARCH_LOOP_IMPROVEMENTS.md §6). So:
+    #   pass 1 synthesizes from the capped, prioritized set
+    #   pass 2 merges the remaining findings into the pass-1 report
+    # Each pass retries once (one retry recovers stochastic failures).
+    # Pass-1 double failure → deterministic fallback below (unchanged).
+    # Pass-2 double failure → keep the pass-1 report + a note: a report
+    # covering the top-N findings beats no report at all.
+    report_text = ""
+    report_passes = 0
+    pass2_note = ""
+    last_exc: Exception | None = None
+
+    def _call_report_llm(system: str, user: str) -> str:
+        # The report is the longest LLM call in the pipeline. Thinking
+        # models can spend the entire default token budget on reasoning
+        # and return an empty answer (observed live on plan_d3df337a),
+        # so it gets its own larger output budget.
         model = config.get_chat_model(task="report", max_tokens=32768)
-        prompt = f"{REPORT_SYSTEM}\n\n{
-            REPORT_USER.format(
-                query=query,
-                plan=questions_text,
-                findings=findings_text,
-                references=references_text,
-            )
-        }"
-        response = invoke_with_cost(model, prompt, task="report")
-        report_text = (
+        response = invoke_with_cost(model, f"{system}\n\n{user}", task="report")
+        content = (
             response.content
             if isinstance(response.content, str)
             else str(response.content)
         )
         # Empty or whitespace-only content does not raise — treat it as a
-        # failure so the deterministic fallback engages instead of persisting
-        # a bodyless report silently.
-        if len(report_text.strip()) < 200:
+        # failure so the fallback engages instead of persisting a bodyless
+        # report silently.
+        if len(content.strip()) < 200:
             raise ValueError(
                 f"LLM returned an empty or too-short report body "
-                f"({len(report_text.strip())} chars after stripping)"
+                f"({len(content.strip())} chars after stripping)"
             )
-    except Exception as exc:
+        return content
+
+    for attempt in range(1, 3):
+        try:
+            print(
+                f"  [REPORT] Pass 1: synthesizing from {len(pass1_findings)} of "
+                f"{len(findings)} findings…"
+            )
+            report_text = _call_report_llm(
+                REPORT_SYSTEM,
+                REPORT_USER.format(
+                    query=query,
+                    plan=questions_text,
+                    findings=pass1_findings_text,
+                    references=references_text,
+                ),
+            )
+            report_passes = 1
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            # Log the actual error (one line, capped): session 6's
+            # OpenAIAPIError left no trace of what failed — class name
+            # alone is not diagnosable.
+            detail = " ".join(str(exc).split())[:200]
+            if attempt == 1:
+                print(
+                    f"  [REPORT] Pass 1 attempt 1 failed "
+                    f"({type(exc).__name__}: {detail}); retrying once"
+                )
+
+    if last_exc is None and pass2_findings:
+        # Pass 2: merge the remaining findings into the pass-1 report.
+        pass2_exc: Exception | None = None
+        for attempt in range(1, 3):
+            try:
+                print(
+                    f"  [REPORT] Pass 2: merging in {len(pass2_findings)} "
+                    "remaining findings…"
+                )
+                report_text = _call_report_llm(
+                    REPORT_SYSTEM,
+                    REPORT_PASS2.format(
+                        report=report_text,
+                        findings=pass2_findings_text,
+                        references=references_text,
+                    ),
+                )
+                report_passes = 2
+                pass2_exc = None
+                break
+            except Exception as exc:
+                pass2_exc = exc
+                detail = " ".join(str(exc).split())[:200]
+                if attempt == 1:
+                    print(
+                        f"  [REPORT] Pass 2 attempt 1 failed "
+                        f"({type(exc).__name__}: {detail}); retrying once"
+                    )
+        if pass2_exc is not None:
+            # Keep the pass-1 report; flag what it is missing.
+            pass2_note = (
+                f"> **Note:** Report synthesized in two passes; the second pass "
+                f"(merging the remaining {len(pass2_findings)} findings) failed "
+                f"after 2 attempts ({type(pass2_exc).__name__}), so this report "
+                f"covers the {len(pass1_findings)} highest-priority findings only.\n"
+            )
+
+    if last_exc is not None:
         # Fallback: simple text report — deterministic, always complete
         report_text = f"# Research Report: {query}\n\n"
         report_text += (
             f"> **Note:** LLM report generation failed or returned no usable "
-            f"content ({type(exc).__name__}). This is the deterministic "
-            f"fallback: all extracted findings, unsynthesized.\n\n"
+            f"content ({type(last_exc).__name__}) after 2 attempts. This is "
+            f"the deterministic fallback: all extracted findings, "
+            f"unsynthesized.\n\n"
         )
         report_text += "## Summary\n"
         report_text += f"- Total questions: {stats.get('total', 0)}\n"
@@ -364,6 +476,11 @@ def _write_findings_node(state) -> dict:
         if question_section:
             report_text = _insert_after_first_heading(report_text, question_section)
 
+        # Pass-2 failure note (lands directly under the title once the
+        # banner inserts above it: title → banner → note → question section).
+        if pass2_note:
+            report_text = _insert_after_first_heading(report_text, pass2_note)
+
         # Interim banner: when questions are still open, the report is a
         # snapshot, not a settled answer — say so at the top. Inserted after
         # the question section so it lands directly under the title.
@@ -374,6 +491,16 @@ def _write_findings_node(state) -> dict:
                 "known so far; the open questions are listed below.\n"
             )
             report_text = _insert_after_first_heading(report_text, banner)
+
+        # ── Suggested Follow-Up Questions (deterministic backstop) ────
+        # REPORT_SYSTEM requires the LLM to write this section. If it
+        # omitted one and the bank still has open questions, append them so
+        # structured follow-ups are never silently lost. The code only lists
+        # real bank rows — it never invents questions.
+        if open_questions and "follow-up questions" not in report_text.lower():
+            followup = build_followup_section(plan_id)
+            if followup:
+                report_text = report_text.rstrip() + "\n\n" + followup
 
     # ── Citation validation & repair ─────────────────────────────
     # The LLM may write its own References section with numbers that don't
@@ -404,6 +531,13 @@ def _write_findings_node(state) -> dict:
     if evidence_matrix_text:
         report_text = report_text.rstrip() + "\n\n" + evidence_matrix_text
 
+    # Pass count: 0 = deterministic fallback, 1 = capped/short plan,
+    # 2 = full two-pass synthesis (or pass-2 failed on a large plan).
+    if last_exc is not None:
+        passes_line = "  Report passes: 0 (deterministic fallback)\n"
+    else:
+        passes_line = f"  Report passes: {report_passes}\n"
+
     stats_text = (
         "\n\n--- Research Stats ---\n"
         f"  Cache hits: {cache_hits}\n"
@@ -411,6 +545,7 @@ def _write_findings_node(state) -> dict:
         f"  Discarded (generic): {len(discarded)}\n"
         f"  Curated knowledge entries: {len(curated)}\n"
         f"  Open questions: {open_questions} of {total_questions}\n"
+        + passes_line
         + citation_stats_line(citation_stats)
     )
     report_text += stats_text
@@ -421,7 +556,8 @@ def _write_findings_node(state) -> dict:
 
     # Save report to DB and file
     if plan_id:
-        save_report(plan_id, query, report_text)
+        report_id = save_report(plan_id, query, report_text)
+        print(f"  [REPORT] Saved {report_id}")
 
     return {
         "final_report": report_text,

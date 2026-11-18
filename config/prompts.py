@@ -90,7 +90,7 @@ Generate recommendations for each raw entry.
 EXTRACTION_SYSTEM = """You are a research analyst extracting key findings from search results.
 
 You may receive content from multiple sources:
-- Structured search results (Exa, Brave, arXiv) with Title/URL/Content blocks
+- Structured search results (Exa, Brave, arXiv, GitHub) with Title/URL/Content blocks
 - Foundational papers / citation discovery (AI-generated summary from Exa answer API)
 
 Both source types are authoritative. Extract findings from ALL content provided.
@@ -181,6 +181,12 @@ Rules:
   plainly and list it under "areas where more research is needed" — the report
   must not read as if it covers what the findings do not support.
 - Note areas where more research is needed
+- Include a "## Suggested Follow-Up Questions" section near the end of the
+  report: 3-7 concrete, self-contained questions derived from the gaps and
+  under-covered areas the report itself identifies (including any named
+  systems you flagged as under-covered above). Each question must be
+  specific enough to drive its own search — name the system, comparison, or
+  mechanism it asks about. Do not repeat questions the report already answers.
 - Include source references for each finding
 - Keep the tone professional and objective
 - Use markdown formatting for readability
@@ -213,4 +219,36 @@ Write a comprehensive research report. Include inline citations like [1], [2] et
 using ONLY the numbers listed above (each finding's "Source: [n]" line tells you
 which number to cite for its claims). Do NOT fabricate facts — only use the
 provided findings.
+"""
+
+# Second report pass: the local model fails on the full findings text at
+# large plans, so pass 1 synthesizes from a capped, prioritized set and
+# pass 2 merges the remaining findings into the pass-1 report. The
+# references block is repeated here because the pass-1 output does not
+# contain the reference list (it is appended to the file later).
+REPORT_PASS2 = """A first draft of a research report is below, followed by ADDITIONAL
+findings that were not included in it (left out of the first pass to keep the
+prompt manageable).
+
+Merge the additional findings into the existing report:
+- Place each new piece of information into the topic section where it
+  belongs; create a new section only if the topic is genuinely new.
+- Add only what is new: do not restate, reword, or drop anything the draft
+  already says.
+- Update "areas where more research is needed" and the suggested follow-up
+  questions only if the new findings change them.
+- Cite sources by the reference numbers given below, as the draft already
+  does. Do NOT write your own References section.
+
+Return the COMPLETE updated report, starting from its title — not just the
+additions.
+
+=== FIRST DRAFT ===
+{report}
+
+=== ADDITIONAL FINDINGS ===
+{findings}
+
+=== REFERENCES (cite using exactly these numbers) ===
+{references}
 """

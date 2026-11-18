@@ -5,6 +5,7 @@ Shared LLM response helpers — JSON extraction from model output.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from utils.cost import get_active_tracker
@@ -63,13 +64,28 @@ def invoke_with_cost(model, prompt, task: str = "unknown") -> Any:
 
     Returns:
         The model's response object.
+
+    Progress logging: every call prints a start line and a done/failed
+    line (with duration and token counts) so a running session is
+    checkable at a glance — the local 7B model can spend minutes on one
+    call, and silence was indistinguishable from a hang.
     """
-    response = model.invoke(prompt)
+    model_name = getattr(model, "model_name", getattr(model, "model", "unknown"))
+    print(f"  [LLM] {task} ({model_name}): generating…", flush=True)
+    t0 = time.monotonic()
+    try:
+        response = model.invoke(prompt)
+    except Exception as exc:
+        print(
+            f"  [LLM] {task} FAILED after {time.monotonic() - t0:.0f}s "
+            f"({type(exc).__name__})",
+            flush=True,
+        )
+        raise
 
     # Extract token counts from response metadata
     input_tokens = 0
     output_tokens = 0
-    model_name = getattr(model, "model_name", getattr(model, "model", "unknown"))
 
     if hasattr(response, "usage_metadata"):
         meta = response.usage_metadata
@@ -92,4 +108,9 @@ def invoke_with_cost(model, prompt, task: str = "unknown") -> Any:
         # silently under-reporting the session's activity.
         tracker.note_unrecorded()
 
+    print(
+        f"  [LLM] {task} done in {time.monotonic() - t0:.0f}s "
+        f"({input_tokens} in / {output_tokens} out tokens)",
+        flush=True,
+    )
     return response

@@ -13,10 +13,12 @@ venv/
 # Environment variables (API keys!)
 .env
 
-# Database & data files
-data/*.db
-data/*.md
-data/reports/
+# Runtime data (knowledge DB, checkpoints, report .md files)
+data/
+
+# Session logs & tool caches
+logs/
+.ruff_cache/
 
 # uv lockfile
 uv.lock

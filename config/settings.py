@@ -71,24 +71,25 @@ class LLMConfig:
             max_tokens: Optional output-token budget override. Thinking models can
                 spend the whole budget on reasoning and return an empty answer, so
                 long-output calls (the final report) pass a larger budget.
-            task: Optional task name for task-specific model routing.
-                Supported tasks: "extraction", "curation", "planning", "report", "summarize"
-                Per-stage overrides live on WorkflowConfig (EXTRACTION_MODEL,
-                CURATION_MODEL, PLANNING_MODEL, REPORT_MODEL, SUMMARIZE_MODEL);
-                falls back to provider-specific model if not set.
+            task: Optional task name for task-specific routing.
+                Supported tasks: "extraction", "curation", "planning", "report".
+                Per-step overrides live on WorkflowConfig: ``{task}_provider``
+                (EXTRACTION_PROVIDER, … — empty = global PROVIDER) and
+                ``{task}_model`` (EXTRACTION_MODEL, … — empty = that provider's
+                default model). This makes cross-provider steps possible, e.g.
+                local extraction + Anthropic report.
         """
         max_tokens = self.max_tokens if max_tokens is None else max_tokens
 
-        # Resolve task-specific model (per-stage overrides live on
-        # WorkflowConfig, not on this LLM config)
-        if not model and task:
-            task_model = getattr(workflow_config, f"{task}_model", "")
-            if task_model:
-                model = task_model
+        # Resolve the effective provider + default model (per-step overrides
+        # live on WorkflowConfig, not on this LLM config)
+        if task:
+            provider, default_model = resolve_step_model(task)
+        else:
+            provider = self.provider
+            default_model = getattr(self, f"{provider}_model", self.local_model)
 
-        # Provider-specific defaults
-        provider = self.provider
-        effective_model = model or getattr(self, f"{provider}_model", self.local_model)
+        effective_model = model or default_model
         effective_temp = self.temperature
 
         if provider == "anthropic":
@@ -136,6 +137,14 @@ class SearchConfig:
     # "exa+brave" runs Exa first, falls back to Brave if Exa results look low-quality
     primary: str = field(default_factory=lambda: os.getenv("SEARCH_PRIMARY", "exa"))
 
+    # arXiv routing override: "auto" (tiered science vocabulary decides),
+    # "web" (never search arXiv), "arxiv" (always arXiv-only, promotes arXiv
+    # to the primary engine), or "both" (always web + arXiv). See
+    # utils/search_routing.py for the auto rules.
+    force_arxiv: str = field(
+        default_factory=lambda: os.getenv("SEARCH_FORCE_ARXIV", "auto")
+    )
+
     # Exa
     exa_api_key: str = field(default_factory=lambda: os.getenv("EXA_API_KEY", ""))
 
@@ -149,9 +158,39 @@ class SearchConfig:
     # Brave
     brave_api_key: str = field(default_factory=lambda: os.getenv("BRAVE_API_KEY", ""))
 
-    # ArXiv (no key needed)
+    # ArXiv (no key needed) — uses the arxiv Python package (typed, rate-limited)
     arxiv_max_results: int = field(
         default_factory=lambda: int(os.getenv("ARXIV_MAX_RESULTS", "10"))
+    )
+
+    # GitHub repositories leg — OSS-flavored queries (OSS_TERMS in
+    # utils/search_routing.py) also search GitHub repos sorted by stars.
+    # Keyless by default (10 search req/min); a GITHUB_TOKEN raises the
+    # limit to 30 req/min.
+    github_token: str = field(default_factory=lambda: os.getenv("GITHUB_TOKEN", ""))
+    github_max_results: int = field(
+        default_factory=lambda: int(os.getenv("GITHUB_MAX_RESULTS", "5"))
+    )
+
+    # GitHub routing override: "auto" (OSS vocabulary decides), "on"
+    # (always run the GitHub leg), "off" (never). See utils/search_routing.py.
+    force_github: str = field(
+        default_factory=lambda: os.getenv("SEARCH_FORCE_GITHUB", "auto")
+    )
+
+    # Playwright browser search — enriches Exa/Brave results by scraping
+    # pages with short/empty content (docs, blogs, tutorials).
+    browser_search_enabled: bool = field(
+        default_factory=lambda: os.getenv("BROWSER_SEARCH_ENABLED", "false").lower()
+        == "true"
+    )
+
+    # Search-result cache TTL in days (env: SEARCH_CACHE_TTL_DAYS).
+    # 0 = cached results never expire. Was hardcoded to 7 days in
+    # db/knowledge.py; raised to 30 so follow-up sessions on the same
+    # topic reuse the earlier searches (set 0 to keep them forever).
+    cache_ttl_days: int = field(
+        default_factory=lambda: int(os.getenv("SEARCH_CACHE_TTL_DAYS", "30"))
     )
 
 
@@ -213,15 +252,28 @@ class WorkflowConfig:
         default_factory=lambda: float(os.getenv("READY_MIN_RESOLUTION", "0.5"))
     )
 
-    # Per-step model overrides (empty = use main config model)
+    # Per-step model overrides (empty = that step's provider's default model).
     extraction_model: str = field(
         default_factory=lambda: os.getenv("EXTRACTION_MODEL", "")
     )
     curation_model: str = field(default_factory=lambda: os.getenv("CURATION_MODEL", ""))
     planning_model: str = field(default_factory=lambda: os.getenv("PLANNING_MODEL", ""))
     report_model: str = field(default_factory=lambda: os.getenv("REPORT_MODEL", ""))
-    summarize_model: str = field(
-        default_factory=lambda: os.getenv("SUMMARIZE_MODEL", "")
+
+    # Per-step provider overrides (empty = global PROVIDER). Lets a single
+    # session mix providers, e.g. local extraction + Anthropic report:
+    #   EXTRACTION_PROVIDER=local  REPORT_PROVIDER=anthropic  REPORT_MODEL=…
+    extraction_provider: str = field(
+        default_factory=lambda: os.getenv("EXTRACTION_PROVIDER", "")
+    )
+    curation_provider: str = field(
+        default_factory=lambda: os.getenv("CURATION_PROVIDER", "")
+    )
+    planning_provider: str = field(
+        default_factory=lambda: os.getenv("PLANNING_PROVIDER", "")
+    )
+    report_provider: str = field(
+        default_factory=lambda: os.getenv("REPORT_PROVIDER", "")
     )
 
 
@@ -249,6 +301,36 @@ config = LLMConfig()
 search_config = SearchConfig()
 paths_config = PathsConfig()
 workflow_config = WorkflowConfig()
+
+_VALID_PROVIDERS = ("local", "openai", "anthropic")
+
+
+def resolve_step_model(task: str) -> tuple[str, str]:
+    """Return the ``(provider, model)`` that workflow step ``task`` runs on.
+
+    Resolution order:
+      provider: ``WorkflowConfig.{task}_provider`` (e.g. REPORT_PROVIDER),
+          falling back to the global ``PROVIDER``.
+      model:    ``WorkflowConfig.{task}_model`` (e.g. REPORT_MODEL),
+          falling back to that provider's default model (LOCAL_MODEL /
+          OPENAI_MODEL / ANTHROPIC_MODEL).
+
+    Raises ValueError for an unknown provider so a typo in e.g.
+    ``REPORT_PROVIDER`` fails loudly at session start (the effective-config
+    banner resolves every step) instead of silently running the step on the
+    local model.
+    """
+    provider = getattr(workflow_config, f"{task}_provider", "") or config.provider
+    if provider not in _VALID_PROVIDERS:
+        raise ValueError(
+            f"Unknown provider {provider!r} for step {task!r} "
+            f"(expected one of: {', '.join(_VALID_PROVIDERS)} — "
+            f"check the {'_'.join((task.upper(), 'PROVIDER'))} env var)"
+        )
+    model = getattr(workflow_config, f"{task}_model", "") or getattr(
+        config, f"{provider}_model", config.local_model
+    )
+    return provider, model
 
 
 # Mapping of config field → (target object, target attribute name).
@@ -279,79 +361,9 @@ def update_config(**kwargs):
 
 
 # ── Topic classification ─────────────────────────────────────────────
-
-# Terms that mark a research topic as science/math/ML. Substring match — used
-# both to add arXiv to the search mix (nodes/search.py, per question) and to
-# enforce at-least-one-arXiv-result in the consolidation gate (any
-# science-flagged question in the plan). Broad everyday words ("model",
-# "paper", "math", ...) are intentionally excluded to avoid over-triggering.
-SCIENCE_TERMS = frozenset(
-    {
-        "algorithm",
-        "training",
-        "reinforcement",
-        "ppo",
-        "grpo",
-        "gpto",
-        "neural",
-        "deep learning",
-        "optimization",
-        "loss",
-        "gradient",
-        "policy",
-        "reward",
-        "benchmark",
-        "arxiv",
-        "theorem",
-        "proof",
-        "probability",
-        "statistics",
-        "regression",
-        "classification",
-        "transformer",
-        "attention",
-        "embedding",
-        "fine-tune",
-        "sft",
-        "rlhf",
-        "alignment",
-        "pretrain",
-        "inference",
-        "latency",
-        "convergence",
-        "generalization",
-        "overfitting",
-        "regularization",
-        "contrastive",
-        "generative",
-        "diffusion",
-        "cnn",
-        "rnn",
-        "lstm",
-        "language model",
-        "llm",
-        "large language",
-        "reasoning",
-        "agentic",
-        "process reward",
-        "critic",
-        "value function",
-        "kl divergence",
-        "monte carlo",
-        "mcts",
-        "bandit",
-        "markov",
-        "dynamic programming",
-        "backprop",
-        "autodiff",
-        "hyperparameter",
-        "batch",
-        "epoch",
-        "dataset",
-        "evaluation",
-        "accuracy",
-        "f1",
-        "precision",
-        "recall",
-    }
-)
+#
+# The science/math/ML vocabulary that decides whether a query also searches
+# arXiv now lives in utils/search_routing.py (tiered STRONG/MEDIUM/WEAK terms
+# with word-boundary matching). It is used both by the search node (per
+# question) and the consolidation gate (via utils.quality.is_science_topic),
+# which stay consistent because both read SearchConfig.force_arxiv.

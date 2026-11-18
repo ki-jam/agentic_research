@@ -6,7 +6,8 @@ Used by consolidation, workflow report builder, and tests.
 
 from __future__ import annotations
 
-from config.settings import SCIENCE_TERMS
+from config.settings import search_config
+from utils.search_routing import plan_search
 
 _GENERIC_PHRASES = (
     "the provided text",
@@ -53,6 +54,11 @@ def filter_quality(findings: list[dict]) -> tuple[list[dict], list[dict]]:
 
 
 def is_science_topic(query: str) -> bool:
-    """Detect if a query is science/math/ML related — arXiv should be used."""
-    query_lower = query.lower()
-    return any(term in query_lower for term in SCIENCE_TERMS)
+    """Detect if a query is science/math/ML related — arXiv should be used.
+
+    Delegates to the tiered, word-boundary-aware routing in
+    ``utils.search_routing`` and honors the configured ``force_arxiv``
+    override so the consolidation gate stays consistent with the search
+    node's per-question decision.
+    """
+    return plan_search(query, force=search_config.force_arxiv).use_arxiv

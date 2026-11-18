@@ -18,18 +18,69 @@ from db.engine import get_db
 from db.knowledge import get_in_progress_question, store_raw_result, search_knowledge
 
 
-def _enforce_domain_cap(results: list[dict], max_per_domain: int = 3) -> list[dict]:
+# Domains exempt from the per-domain cap. The cap exists to stop one
+# popular site (Wikipedia, a vendor blog, ...) from eating the whole
+# extraction budget and dominating the report. On these domains every
+# URL is a distinct primary source — a separate repo, a separate paper —
+# so capping would drop evidence instead of noise. Suffix match, so
+# dl.acm.org counts as acm.org and link.springer.com as springer.com.
+UNCAPPED_DOMAINS: frozenset[str] = frozenset(
+    {
+        "github.com",
+        "arxiv.org",
+        # academic publishers
+        "nature.com",
+        "science.org",
+        "sciencedirect.com",
+        "springer.com",
+        "acm.org",
+        "ieee.org",
+        "pnas.org",
+        "plos.org",
+        "mdpi.com",
+        "cell.com",
+        "frontiersin.org",
+        "tandfonline.com",
+        "wiley.com",
+        "oup.com",
+        "cambridge.org",
+        "jamanetwork.com",
+        "royalsocietypublishing.org",
+        # conference proceedings
+        "aclanthology.org",
+        "openreview.net",
+        "neurips.cc",
+        "icml.cc",
+        "iclr.cc",
+        "mlr.press",
+    }
+)
+
+
+def _is_uncapped_domain(domain: str, uncapped: frozenset[str]) -> bool:
+    """True when the domain (or its registrable parent) is exempt from the cap."""
+    return domain in uncapped or any(domain.endswith("." + d) for d in uncapped)
+
+
+def _enforce_domain_cap(
+    results: list[dict],
+    max_per_domain: int = 3,
+    uncapped: frozenset[str] = UNCAPPED_DOMAINS,
+) -> list[dict]:
     """Limit how many results come from any single domain.
 
-    Prevents popular sites (arXiv, Wikipedia, etc.) from dominating the
-    report. Inspired by deep-researcher-node's per-domain caps.
+    Prevents popular sites (Wikipedia, vendor blogs, ...) from dominating
+    the report. Inspired by deep-researcher-node's per-domain caps.
 
     Args:
         results: list of search result dicts with 'url' keys
         max_per_domain: maximum results per domain (default: 3)
+        uncapped: domains that are never capped (default: UNCAPPED_DOMAINS).
+            Every URL there is a distinct primary source (a separate repo
+            or paper), so the cap would drop evidence instead of noise.
 
     Returns:
-        Filtered list with at most max_per_domain results per domain
+        Filtered list with at most max_per_domain results per capped domain
     """
     domain_counts: dict[str, int] = {}
     kept: list[dict] = []
@@ -42,11 +93,28 @@ def _enforce_domain_cap(results: list[dict], max_per_domain: int = 3) -> list[di
             domain = domain.removeprefix("www.")
         else:
             domain = "(unknown)"
+        if _is_uncapped_domain(domain, uncapped):
+            kept.append(r)
+            continue
         count = domain_counts.get(domain, 0)
         if count < max_per_domain:
             kept.append(r)
             domain_counts[domain] = count + 1
     return kept
+
+
+def _kb_hits_text(kb_hits: list[dict]) -> str:
+    """Format knowledge-base hits into a prefix block (empty string if none).
+
+    Shared by the cache-hit and fresh-search paths so both prepend the same
+    "[KNOWLEDGE BASE HITS]" context for extraction.
+    """
+    if not kb_hits:
+        return ""
+    return "\n\n[KNOWLEDGE BASE HITS]\n" + "\n\n---\n\n".join(
+        f"Title: {h.get('title', '')}\nSummary: {h.get('summary', '')}\nTags: {h.get('topic_tags', '')}"
+        for h in kb_hits
+    )
 
 
 def search_execution_node(state) -> dict:
@@ -87,24 +155,71 @@ def search_execution_node(state) -> dict:
                 "  [CITATION DISCOVERY] Skipped (this plan already has citation results)"
             )
 
-    # ── 1. Detect science/math/ML topics → also search arXiv ──────
-    from utils.quality import is_science_topic as _is_science
+    # ── 1. Routing decision — web / arXiv / both (+ GitHub leg) ───
+    # Tiered, word-boundary-aware science detection plus the OSS
+    # vocabulary for the GitHub repositories leg (see
+    # utils/search_routing.py). Honors the SEARCH_FORCE_ARXIV and
+    # SEARCH_FORCE_GITHUB overrides.
+    from utils.search_routing import github_search_query, plan_search
 
-    search_arxiv = _is_science(query)
+    force = (search_config.force_arxiv or "auto").strip().lower()
+    if force not in ("auto", "web", "arxiv", "both"):
+        force = "auto"
+    plan = plan_search(query, force=force, force_github=search_config.force_github)
+    search_arxiv = plan.use_arxiv
+    search_github = plan.use_github
+
+    # GitHub's search API ANDs every keyword, so the leg searches a
+    # compact phrase derived from the question (see
+    # utils.search_routing.github_search_query), never the full question.
+    github_q = github_search_query(query) if search_github else ""
+    if search_github and not github_q:
+        search_github = False  # nothing salient to search for
+
+    # force="arxiv" promotes arXiv to the primary engine; otherwise the
+    # configured primary drives the web leg.
+    primary = "arxiv" if force == "arxiv" else search_config.primary
+
+    routing_note = plan.reason
+    if plan.use_github:
+        routing_note = f"{routing_note}; github: {plan.github_reason} q={github_q!r}"
+    print(
+        f"  [ROUTING] {query[:60]} → web={plan.use_web} arxiv={plan.use_arxiv} "
+        f"github={search_github} ({routing_note})"
+    )
 
     # ── 2. Check SQLite cache ───────────────────────────────────
-    cache_key = f"{query}||{search_config.primary}||{search_arxiv}"
+    # Include the per-engine result caps so a change to them invalidates
+    # stale merges.
+    cache_key = (
+        f"{query}||{primary}||{search_arxiv}||{search_config.arxiv_max_results}"
+        f"||{search_github}||{search_config.github_max_results}"
+    )
+    if search_github:
+        # The phrase determines what the GitHub leg returns, so it is part
+        # of the merge's identity. (Also invalidates entries cached before
+        # phrase derivation existed — those merges have no repo grounding.)
+        cache_key += f"||{github_q}"
     cached = check_cache(cache_key)
     if cached is not None:
         content = _format_results(cached)
         title = cached[0].get("title", query)
         url = cached[0].get("url", "")
-        engine_label = f"{search_config.primary} (cached)"
-        if search_arxiv:
+        engine_label = f"{primary} (cached)"
+        if search_arxiv and primary != "arxiv":
             engine_label += "+arxiv"
+        if search_github:
+            engine_label += "+github"
         print(
             f"  [CACHE HIT] {query[:60]} → {len(cached)} results cached from {engine_label}"
         )
+        # Prepend KB hits so the cached path matches the fresh path.
+        kb_prefix = _kb_hits_text(kb_hits)
+        if kb_prefix:
+            content = kb_prefix + "\n\n---\n\n" + content
+            print(
+                f"  [KB HIT] {len(kb_hits)} knowledge entry(s) from prior iterations: {[h['title'][:50] for h in kb_hits]}"
+            )
         store_raw_result(
             question_id=question["id"],
             plan_id=plan_id,
@@ -116,80 +231,143 @@ def search_execution_node(state) -> dict:
         )
         return {}
 
-    # ── 3. Execute primary search ─────────────────────────────────
+    # ── 3. Execute the web leg (primary engine) ──────────────────
     results = None
-    error = None
+    arxiv_fetched = False  # True once arXiv has produced `results`
+    results_source = None  # "web" or "arxiv" — where `results` came from
     try:
-        if search_config.primary == "exa":
-            results = _search_exa(query)
-        elif search_config.primary == "brave":
-            results = _search_brave(query)
-        elif search_config.primary == "arxiv":
-            results = _search_arxiv(query)
-        elif search_config.primary == "exa+brave":
-            results = _search_exa(query)
-            # If Exa results look low-quality, fall back to Brave
-            if results and _results_look_low_quality(results):
-                print("  [SEARCH] Exa results look low-quality → trying Brave")
-                brave_results = _search_brave(query)
-                if brave_results and len(brave_results) >= len(results):
-                    results = brave_results
-        else:
-            results = _fallback_search(query)
-    except Exception as e:
-        error = str(e)
-
-    # ── 4. Fallback if primary failed ───────────────────────────
-    if not results or len(results) == 0:
-        fallback = "brave" if search_config.primary != "brave" else "arxiv"
-        try:
-            if fallback == "brave":
+        if plan.use_web:
+            if primary == "exa":
+                results = _search_exa(query)
+                results_source = "web"
+            elif primary == "brave":
                 results = _search_brave(query)
-            elif fallback == "arxiv":
+                results_source = "web"
+            elif primary == "arxiv":
                 results = _search_arxiv(query)
+                arxiv_fetched = True
+                results_source = "arxiv"
+            elif primary == "exa+brave":
+                results = _search_exa(query)
+                # If Exa results look low-quality, fall back to Brave
+                if results and _results_look_low_quality(results):
+                    print("  [SEARCH] Exa results look low-quality → trying Brave")
+                    brave_results = _search_brave(query)
+                    if brave_results and len(brave_results) >= len(results):
+                        results = brave_results
+                results_source = "web"
             else:
                 results = _fallback_search(query)
-        except Exception:
-            results = [
-                {"title": f"Error: {error or 'unknown'}", "content": "", "url": ""}
-            ]
+    except Exception as e:
+        error = str(e)
+        results_source = None
+        print(f"  [SEARCH] primary '{primary}' failed: {error}")
 
-    # ── 5. Also search arXiv for science/math/ML topics ─────────
+    # ── 4. Fallback if the web leg failed / returned nothing ─────
+    if plan.use_web and (not results or len(results) == 0):
+        # arXiv is the keyless engine of last resort, but only when the
+        # routing plan actually wants arXiv. For web-only topics, falling
+        # back to papers would be noise (e.g. "what is an F1 visa") — an
+        # honest empty row is better than junk results.
+        if primary != "brave":
+            fallback = "brave"
+        elif search_arxiv:
+            fallback = "arxiv"
+        else:
+            fallback = None
+        if fallback:
+            try:
+                if fallback == "brave":
+                    results = _search_brave(query)
+                    results_source = "web"
+                elif fallback == "arxiv":
+                    results = _search_arxiv(query)
+                    arxiv_fetched = True
+                    results_source = "arxiv"
+                else:
+                    results = _fallback_search(query)
+            except Exception:
+                # Honest empty (no fake "Error:" row): a genuine no-results
+                # state stays honest, and a stored empty row still counts as
+                # "an actual search was attempted" for the consolidation gate.
+                results = None
+                results_source = None
+
+    # ── 5. arXiv leg (science topics) — skip if arXiv already ran ──
     arxiv_results = None
-    if search_arxiv:
+    if search_arxiv and not arxiv_fetched:
         try:
             arxiv_results = _search_arxiv(query)
         except Exception:
-            pass
+            arxiv_results = None
 
-    # ── 6. Merge results (primary + arXiv if applicable) ────────
-    all_results = list(results)
-    if arxiv_results:
+    # ── 5.5. GitHub leg (OSS topics) — supplementary repos, by stars ──
+    # A GitHub failure (rate limit, network) degrades to a web-only merge;
+    # the search itself still succeeds.
+    github_results = None
+    if search_github:
+        try:
+            github_results = _search_github(github_q)
+            if not github_results and " " in github_q:
+                # GitHub ANDs every keyword, so a two-term phrase can still
+                # match nothing. Retry with the leading term alone.
+                github_results = _search_github(github_q.split()[0])
+            if github_results:
+                print(f"  [GITHUB] {len(github_results)} repos for: {github_q!r}")
+        except Exception as e:
+            print(f"  [GITHUB] search failed: {e}")
+            github_results = None
+
+    # ── 6. Merge results (primary + arXiv + GitHub if applicable) ──
+    all_results = list(results or [])
+    for leg in (arxiv_results, github_results):
+        if not leg:
+            continue
         # Avoid exact duplicate URLs
         existing_urls = {r.get("url", "") for r in all_results if r.get("url")}
-        for r in arxiv_results:
+        for r in leg:
             if r.get("url") not in existing_urls:
                 all_results.append(r)
 
-    # ── 7. Enforce per-domain caps (source diversity) ────────
+    # ── 7. Browser enrichment — fill in content where missing ────
+    # For results with short/empty content, fetch the page and extract
+    # visible text. This catches docs, blogs, and tutorials that APIs
+    # return as links but without meaningful snippet text.
+    if search_config.browser_search_enabled:
+        all_results = _enrich_with_browser(all_results)
+
+    # ── 8. Enforce per-domain caps (source diversity) ────────
+    # Stops one site (Wikipedia, a vendor blog) from eating the whole
+    # extraction budget. github.com, arxiv.org and academic publishers
+    # are exempt (UNCAPPED_DOMAINS) — every URL there is a distinct
+    # primary source. Previously they only got a raised cap (5), shared
+    # with the primary engine's own github.com URLs: Exa's repos filled
+    # it first and the GitHub leg's repos were silently truncated to
+    # whatever slots were left.
     all_results = _enforce_domain_cap(all_results)
 
-    # ── 8. Store in SQLite cache ────────────────────────────────
-    engine_label = f"{search_config.primary}"
-    if arxiv_results:
-        engine_label += "+arxiv"
+    # ── 9. Store in SQLite cache ────────────────────────────────
+    # Label reflects what actually produced content: the primary engine,
+    # plus "+arxiv" when arXiv results were merged in — either via the
+    # science leg, or because arXiv was reached through the fallback
+    # chain — and "+github" when repo results were merged in.
+    if primary == "arxiv":
+        engine_label = "arxiv"
+    elif arxiv_results or results_source == "arxiv":
+        engine_label = f"{primary}+arxiv"
+    else:
+        engine_label = f"{primary}"
+    if github_results:
+        engine_label += "+github"
     store_cache(cache_key, all_results, engine=engine_label)
 
-    # ── 9. Store raw results in DB ──────────────────────────────
+    # ── 10. Store raw results in DB ──────────────────────────────
     content = _format_results(all_results)
 
     # Prepend knowledge base hits if any (so extraction sees KB context too)
-    if kb_hits:
-        kb_text = "\n\n[KNOWLEDGE BASE HITS]\n" + "\n\n---\n\n".join(
-            f"Title: {h.get('title', '')}\nSummary: {h.get('summary', '')}\nTags: {h.get('topic_tags', '')}"
-            for h in kb_hits
-        )
-        content = kb_text + "\n\n---\n\n" + content
+    kb_prefix = _kb_hits_text(kb_hits)
+    if kb_prefix:
+        content = kb_prefix + "\n\n---\n\n" + content
         print(
             f"  [KB HIT] {len(kb_hits)} knowledge entry(s) from prior iterations: {[h['title'][:50] for h in kb_hits]}"
         )
@@ -271,34 +449,83 @@ def _search_brave(query: str) -> list[dict]:
 
 
 def _search_arxiv(query: str) -> list[dict]:
-    """Search via arXiv API (no key needed)."""
-    import xml.etree.ElementTree as ET
+    """Search via arXiv using the arxiv Python package (typed, rate-limited).
 
-    url = (
-        f"http://export.arxiv.org/api/query?search_query=all:{urllib.parse.quote(query)}"
-        f"&max_results={search_config.arxiv_max_results}"
-    )
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        xml_data = resp.read()
-    root = ET.fromstring(xml_data)
-    ns = {"atom": "http://www.w3.org/2005/Atom"}
-    entries = root.findall("atom:entry", ns)
-    results = []
-    for entry in entries:
-        title = entry.find("atom:title", ns).text.replace("\n", " ")
-        summary = entry.find("atom:summary", ns).text.replace("\n", " ")
-        link = entry.find("atom:id", ns).text
-        authors = [
-            a.find("atom:name", ns).text for a in entry.findall("atom:author", ns)
-        ]
-        results.append(
+    Falls back to raw XML parsing if the arxiv package is not installed.
+    """
+    from nodes.arxiv_search import search_arxiv as _arxiv_search
+
+    return _arxiv_search(query, max_results=search_config.arxiv_max_results)
+
+
+def _search_github(query: str) -> list[dict]:
+    """Search GitHub repositories via the REST search API (no key needed).
+
+    Grounds OSS/library questions in real repos: owner/name, description,
+    stars, language, topics. Sorted by stars so established projects rank
+    first (the extraction prompt already weights established tools over
+    niche ones). Unauthenticated: 10 search req/min; with GITHUB_TOKEN:
+    30 req/min. Same urllib style as _search_brave.
+    """
+    params = {
+        "q": query,
+        "sort": "stars",
+        "order": "desc",
+        "per_page": str(search_config.github_max_results),
+    }
+    url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode(params)
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "research-agent",
+    }
+    if search_config.github_token:
+        headers["Authorization"] = f"Bearer {search_config.github_token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for r in data.get("items", []):
+        owner = (r.get("owner") or {}).get("login", "")
+        name = r.get("name", "")
+        meta = []
+        if r.get("stargazers_count") is not None:
+            meta.append(f"{r['stargazers_count']} stars")
+        if r.get("language"):
+            meta.append(r["language"])
+        if r.get("topics"):
+            meta.append("topics: " + ", ".join(r["topics"][:5]))
+        content = r.get("description") or ""
+        if meta:
+            content = f"{content} | {' | '.join(meta)}" if content else " | ".join(meta)
+        out.append(
             {
-                "title": title,
-                "url": link,
-                "content": f"Authors: {', '.join(authors)}\n{summary}",
+                "title": f"{owner}/{name}" if owner else name,
+                "url": r.get("html_url", ""),
+                "content": content,
             }
         )
-    return results
+    return out
+
+
+def _enrich_with_browser(results: list[dict]) -> list[dict]:
+    """Enrich results with browser-extracted content where missing.
+
+    Wraps browser_search.enrich_with_browser in a try/except so browser
+    failures never break the search pipeline.
+    """
+    try:
+        from nodes.browser_search import enrich_with_browser as _enrich
+
+        enriched = _enrich(results, max_pages=3)
+        enriched_count = sum(1 for r in enriched if r.get("content_source"))
+        if enriched_count:
+            print(f"  [BROWSER] Enriched {enriched_count} result(s) with page content")
+        return enriched
+    except ImportError:
+        print("  [BROWSER] playwright not installed — skipping enrichment")
+        return results
+    except Exception:
+        return results  # non-critical: don't break search on scrape failure
 
 
 def _fallback_search(query: str) -> list[dict]:
@@ -330,9 +557,16 @@ def _results_look_low_quality(results: list[dict]) -> bool:
 
     n = len(results)
 
-    # Signal 1: Most results are GitHub repos
-    github_count = sum(1 for r in results if "github.com" in r.get("url", "").lower())
-    if github_count > n * 0.6:
+    # Signal 1: Most results are GitHub repos WITH short content. Exa
+    # returns README text for OSS repos (the core use case), so a GitHub
+    # result with real content is NOT a low-quality signal.
+    github_thin = sum(
+        1
+        for r in results
+        if "github.com" in r.get("url", "").lower()
+        and (not r.get("content") or len(r.get("content", "")) < 50)
+    )
+    if github_thin > n * 0.6:
         return True
 
     # Signal 2: Most results have empty or very short content

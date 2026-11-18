@@ -29,12 +29,14 @@ from db.knowledge import (
     cache_store,
     create_finding,
     create_knowledge_entry,
+    cluster_plan_questions,
     create_plan,
     create_questions,
     deduplicate_and_prioritize,
     get_in_progress_question,
     get_pending_question,
     get_pending_questions,
+    get_question,
     get_plan_entries,
     get_plan_findings,
     get_plan_stats,
@@ -42,6 +44,7 @@ from db.knowledge import (
     get_source_coverage,
     get_stats,
     search_knowledge,
+    set_question_discarded,
     set_question_failed,
     set_question_in_progress,
     set_question_resolved,
@@ -262,10 +265,13 @@ def test_retry_resets_failed_question_to_pending():
 def test_add_question_ids_never_collide():
     """uuid4 IDs: adding the same question twice must not raise a
     primary-key collision (the old hash-based IDs could collide).
+
+    Uses a user source: the insert-time similarity guard suppresses
+    duplicate AUTO questions (see the guard tests below).
     """
     plan_id = create_plan("Test", [])
-    i1 = add_question(plan_id, "Same question text")
-    i2 = add_question(plan_id, "Same question text")
+    i1 = add_question(plan_id, "Same question text", discovered_by="user")
+    i2 = add_question(plan_id, "Same question text", discovered_by="user")
     assert i1 != i2
     assert len(get_pending_questions(plan_id)) == 2
 
@@ -439,6 +445,50 @@ def test_cache_store_and_retrieve():
 def test_cache_miss_on_different_query():
     store_cache("query A", [{"title": "A"}], engine="exa")
     assert check_cache("query B") is None
+
+
+# ── DB: Cache TTL ───────────────────────────────────────────────────
+#
+# The TTL used to be hardcoded to 7 days in cache_check(). It is now
+# search_config.cache_ttl_days (env SEARCH_CACHE_TTL_DAYS, default 30;
+# 0 = never expire).
+
+
+def test_cache_ttl_expires_entries_older_than_ttl(monkeypatch):
+    from config.settings import search_config
+
+    monkeypatch.setattr(search_config, "cache_ttl_days", 30)
+    cache_store("ttl-old", "Old query", "exa", [{"title": "T"}])
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE search_cache SET cached_at = datetime('now', '-31 days') "
+            "WHERE query_hash = 'ttl-old'"
+        )
+    assert cache_check("ttl-old") is None
+
+
+def test_cache_ttl_zero_never_expires(monkeypatch):
+    from config.settings import search_config
+
+    monkeypatch.setattr(search_config, "cache_ttl_days", 0)
+    cache_store("ttl-never", "Never query", "exa", [{"title": "T"}])
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE search_cache SET cached_at = datetime('now', '-1000 days') "
+            "WHERE query_hash = 'ttl-never'"
+        )
+    row = cache_check("ttl-never")
+    assert row is not None
+    assert row["query"] == "Never query"
+
+
+def test_cache_ttl_fresh_entry_hits(monkeypatch):
+    from config.settings import search_config
+
+    monkeypatch.setattr(search_config, "cache_ttl_days", 30)
+    cache_store("ttl-fresh", "Fresh query", "exa", [{"title": "T"}])
+    row = cache_check("ttl-fresh")
+    assert row is not None
 
 
 # ── Planning Node ───────────────────────────────────────────────────
@@ -1016,6 +1066,83 @@ def test_consolidation_gaps_become_questions(monkeypatch):
     assert {q["question"] for q in pending} == {"gap one", "gap two"}
 
 
+# ── Gap → question shape fix (_gap_to_question) ────────────────────
+#
+# The readiness LLM emits gaps as statements ("Missing TGI performance
+# details"), and the old code stored those verbatim as "questions" —
+# the search node then fed the statement straight into a search query
+# (live example: q_plan_f9b12648_6ad4d299).
+
+
+def test_gap_to_question_wraps_missing_statements():
+    from nodes.consolidation import _gap_to_question
+
+    assert (
+        _gap_to_question("Missing TGI current performance details")
+        == "What do we still need to know about TGI current performance details?"
+    )
+    assert (
+        _gap_to_question("No head-to-head benchmarks for SGLang vs vLLM")
+        == "What do we still need to know about head-to-head benchmarks for SGLang vs vLLM?"
+    )
+    # Acronyms and camelCase must survive the wrap (the old code
+    # lowercased the first letter: "TGI" → "tgi").
+    assert (
+        _gap_to_question("Missing Tensorflow coverage")
+        == "What do we still need to know about Tensorflow coverage?"
+    )
+
+
+def test_gap_to_question_passes_through_questions_and_noun_phrases():
+    from nodes.consolidation import _gap_to_question
+
+    assert (
+        _gap_to_question("How does vLLM schedule requests?")
+        == "How does vLLM schedule requests?"
+    )
+    # Noun phrases already work as search queries — unchanged.
+    assert (
+        _gap_to_question("API compatibility and ecosystem integrations")
+        == "API compatibility and ecosystem integrations"
+    )
+
+
+def test_consolidation_gap_statement_becomes_question_in_bank(monkeypatch):
+    from nodes.consolidation import consolidation_node
+    from config import settings
+
+    class MockModel:
+        def invoke(self, prompt, **kwargs):
+            return type(
+                "R",
+                (),
+                {
+                    "content": json.dumps(
+                        {
+                            "ready": False,
+                            "gaps": ["Missing TGI current performance details"],
+                            "confidence": "low",
+                        }
+                    )
+                },
+            )()
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": MockModel(),
+    )
+    plan_id = create_plan("Test", [])
+    create_questions(plan_id, [{"question": "Q1", "priority": "high"}])
+    set_question_resolved(f"q_{plan_id}_0")
+    result = consolidation_node({"plan_ref": plan_id, "iteration_count": 0})
+    assert result["_route"] == "manage_backlog"
+    pending = get_pending_questions(plan_id)
+    assert [q["question"] for q in pending] == [
+        "What do we still need to know about TGI current performance details?"
+    ]
+
+
 def test_consolidation_evaluation_failure_falls_back_to_heuristic(monkeypatch):
     """If the readiness LLM is down, consolidation must not crash — it falls
     back to a heuristic (ready iff all resolved + enough findings).
@@ -1344,8 +1471,10 @@ def test_consolidation_adds_gaps_even_with_pending_questions(monkeypatch):
     assert len(added_texts) == 2, (
         f"Expected 2 gap-questions, got {len(added_texts)}: {added_texts}"
     )
-    assert "No TensorFlow coverage" in added_texts[0]
-    assert "Missing JAX comparison" in added_texts[1]
+    # Gap statements arrive as questions now (see _gap_to_question), so
+    # assert on the topic, not the raw statement wording.
+    assert "TensorFlow coverage" in added_texts[0]
+    assert "JAX comparison" in added_texts[1]
 
 
 def test_consolidation_gaps_limit_to_5_per_pass(monkeypatch):
@@ -1521,6 +1650,398 @@ def test_write_findings_falls_back_on_empty_llm_report(e2e_env, monkeypatch):
     # Question section is still guaranteed
     assert "## Research Question" in report
     assert "What is the core mechanism?" in report
+
+
+def test_write_findings_retries_flaky_llm_report(e2e_env, monkeypatch):
+    """A flaky model (first call returns a too-short body, second call
+    succeeds) must yield the synthesized report via the retry — not the
+    deterministic fallback. Regression for the live sessions where 2 of 3
+    consecutive report generations failed on the local 7B model."""
+    from config import settings
+    from graph.workflow import _write_findings_node
+
+    plan_id = create_plan("Retry report test", [])
+    create_questions(
+        plan_id, [{"question": "What is the core mechanism?", "priority": "high"}]
+    )
+    qid = f"q_{plan_id}_0"
+    set_question_in_progress(qid)
+    rid = store_raw_result(qid, plan_id, "q", "exa", "content", "Source A")
+    create_finding(
+        qid,
+        rid,
+        None,
+        [{"claim": "The mechanism behaves as specified.", "confidence": "high"}],
+        "The mechanism behaves as specified and is widely adopted.",
+        ["e2e"],
+    )
+
+    calls = {"n": 0}
+
+    class FlakyModel:
+        def invoke(self, prompt, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return type("R", (), {"content": "too short"})()
+            return type(
+                "R", (), {"content": "# Report\n\n" + "The synthesized body. " * 20}
+            )()
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": FlakyModel(),
+    )
+    result = _write_findings_node(
+        {
+            "plan_ref": plan_id,
+            "original_query": "What is the core mechanism?",
+        }
+    )
+
+    report = result["final_report"]
+    assert calls["n"] == 2, "retry should make exactly one extra LLM call"
+    assert "deterministic fallback" not in report
+    assert "The synthesized body." in report
+
+
+# ── Report: two-pass synthesis ──────────────────────────────────────
+#
+# The local 7B model fails on the full findings text at large plans
+# (prompt-size driven). Pass 1 synthesizes from REPORT_PASS1_FINDINGS
+# (capped, prioritized: citation findings first, then question priority);
+# pass 2 merges the remaining findings into the pass-1 report.
+
+
+def _seed_report_plan(n_findings: int, priorities=None) -> str:
+    """Plan with n resolved questions, each with one distinct finding."""
+    priorities = priorities or ["medium"] * n_findings
+    plan_id = create_plan("Two-pass report", [])
+    # ONE create_questions call: it assigns index-based ids
+    # q_{plan_id}_{i} starting at 0 per call, so a per-question loop
+    # collides on the UNIQUE constraint.
+    create_questions(
+        plan_id,
+        [
+            {
+                "question": f"Question number {i} about topic {i}?",
+                "priority": priorities[i],
+            }
+            for i in range(n_findings)
+        ],
+    )
+    for i in range(n_findings):
+        qid = f"q_{plan_id}_{i}"
+        set_question_in_progress(qid)
+        rid = store_raw_result(
+            qid, plan_id, f"q{i}", "exa", f"content {i}", f"Source {i}"
+        )
+        create_finding(
+            qid,
+            rid,
+            None,
+            [{"claim": f"Claim number {i} is specific.", "confidence": "high"}],
+            f"Unique finding summary number {i} alpha.",
+            ["report-test"],
+        )
+        set_question_resolved(qid)
+    return plan_id
+
+
+def _patch_report_model(monkeypatch, model):
+    from config import settings
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model_name="", max_tokens=None, task="": model(),
+    )
+
+
+def test_report_two_passes_when_over_cap(monkeypatch, tmp_path):
+    from config.settings import paths_config
+    from graph.workflow import _write_findings_node
+
+    monkeypatch.setattr(paths_config, "base_dir", str(tmp_path))
+    monkeypatch.setattr("graph.workflow.REPORT_PASS1_FINDINGS", 2)
+    plan_id = _seed_report_plan(3)
+
+    prompts = []
+
+    class TwoPassModel:
+        def invoke(self, prompt, **kwargs):
+            prompts.append(prompt)
+            if "=== FIRST DRAFT ===" in prompt:
+                return type(
+                    "R", (), {"content": "# Merged\n\n" + "Pass two merged body. " * 20}
+                )()
+            return type(
+                "R", (), {"content": "# Draft\n\n" + "Pass one draft body. " * 20}
+            )()
+
+    _patch_report_model(monkeypatch, TwoPassModel)
+    result = _write_findings_node(
+        {"plan_ref": plan_id, "original_query": "Two-pass report topic"}
+    )
+
+    report = result["final_report"]
+    assert len(prompts) == 2, "over-cap plan must make exactly two LLM calls"
+    assert "Pass two merged body." in report
+    assert "Report passes: 2" in report
+    # Pass 1's prompt carried only the capped set (2 of 3 findings)
+    assert prompts[0].count("### Finding:") == 2
+    # Pass 2's prompt carried the pass-1 report plus the remaining finding
+    assert "Pass one draft body." in prompts[1]
+    assert prompts[1].count("### Finding:") == 1
+
+
+def test_report_single_pass_under_cap(monkeypatch, tmp_path):
+    from config.settings import paths_config
+    from graph.workflow import _write_findings_node
+
+    monkeypatch.setattr(paths_config, "base_dir", str(tmp_path))
+    plan_id = _seed_report_plan(2)  # default cap is 25
+
+    calls = {"n": 0}
+
+    class OneShotModel:
+        def invoke(self, prompt, **kwargs):
+            calls["n"] += 1
+            return type("R", (), {"content": "# One\n\n" + "Single pass body. " * 20})()
+
+    _patch_report_model(monkeypatch, OneShotModel)
+    result = _write_findings_node(
+        {"plan_ref": plan_id, "original_query": "One-pass report topic"}
+    )
+
+    assert calls["n"] == 1
+    assert "Single pass body." in result["final_report"]
+    assert "Report passes: 1" in result["final_report"]
+
+
+def test_report_pass2_failure_keeps_pass1_with_note(monkeypatch, tmp_path):
+    """Pass-2 double failure must keep the pass-1 report (with a note),
+    not discard it into the deterministic fallback."""
+    from config.settings import paths_config
+    from graph.workflow import _write_findings_node
+
+    monkeypatch.setattr(paths_config, "base_dir", str(tmp_path))
+    monkeypatch.setattr("graph.workflow.REPORT_PASS1_FINDINGS", 1)
+    plan_id = _seed_report_plan(3)
+
+    class SplitModel:
+        def invoke(self, prompt, **kwargs):
+            if "=== FIRST DRAFT ===" in prompt:
+                raise RuntimeError("pass 2 exploded")
+            return type("R", (), {"content": "# Draft\n\n" + "Pass one body. " * 30})()
+
+    _patch_report_model(monkeypatch, SplitModel)
+    result = _write_findings_node(
+        {"plan_ref": plan_id, "original_query": "Pass2-failure topic"}
+    )
+
+    report = result["final_report"]
+    assert "Pass one body." in report
+    assert "deterministic fallback" not in report
+    assert "second pass" in report  # the failure note
+    assert "RuntimeError" in report
+    assert "Report passes: 1" in report
+
+
+def test_report_pass1_failure_uses_full_fallback(monkeypatch, tmp_path):
+    """Pass-1 double failure keeps the existing deterministic fallback,
+    which embeds EVERY finding (uncapped)."""
+    from config.settings import paths_config
+    from graph.workflow import _write_findings_node
+
+    monkeypatch.setattr(paths_config, "base_dir", str(tmp_path))
+    monkeypatch.setattr("graph.workflow.REPORT_PASS1_FINDINGS", 1)
+    plan_id = _seed_report_plan(3)
+
+    class BrokenModel:
+        def invoke(self, prompt, **kwargs):
+            raise RuntimeError("always broken")
+
+    _patch_report_model(monkeypatch, BrokenModel)
+    result = _write_findings_node(
+        {"plan_ref": plan_id, "original_query": "Pass1-failure topic"}
+    )
+
+    report = result["final_report"]
+    assert "deterministic fallback" in report
+    assert "Report passes: 0" in report
+    # Fallback is uncapped: every finding is present
+    for i in range(3):
+        assert f"Unique finding summary number {i} alpha." in report
+
+
+def test_report_pass1_prefers_citations_and_high_priority(monkeypatch, tmp_path):
+    """Pass-1 selection order: citation findings first, then question
+    priority (high → medium → low)."""
+    from config.settings import paths_config
+    from graph.workflow import _write_findings_node
+
+    monkeypatch.setattr(paths_config, "base_dir", str(tmp_path))
+    monkeypatch.setattr("graph.workflow.REPORT_PASS1_FINDINGS", 2)
+
+    plan_id = create_plan("Priority report", [])
+    # q0: low, q1: high, q2: medium + citation engine
+    create_questions(
+        plan_id,
+        [
+            {"question": "Low priority question?", "priority": "low"},
+            {"question": "High priority question?", "priority": "high"},
+            {"question": "Citation question?", "priority": "medium"},
+        ],
+    )
+    engines = ["exa", "exa", "exa-answer"]
+    for i in range(3):
+        qid = f"q_{plan_id}_{i}"
+        set_question_in_progress(qid)
+        rid = store_raw_result(
+            qid, plan_id, f"q{i}", engines[i], f"content {i}", f"Source {i}"
+        )
+        create_finding(
+            qid,
+            rid,
+            None,
+            [{"claim": f"Claim {i}.", "confidence": "high"}],
+            f"Unique finding summary number {i} alpha.",
+            ["report-test"],
+        )
+        set_question_resolved(qid)
+
+    prompts = []
+
+    class TwoPassModel:
+        def invoke(self, prompt, **kwargs):
+            prompts.append(prompt)
+            if "=== FIRST DRAFT ===" in prompt:
+                return type(
+                    "R", (), {"content": "# Merged\n\n" + "Merged body. " * 20}
+                )()
+            return type("R", (), {"content": "# Draft\n\n" + "Draft body. " * 20})()
+
+    _patch_report_model(monkeypatch, TwoPassModel)
+    result = _write_findings_node(
+        {"plan_ref": plan_id, "original_query": "Priority topic"}
+    )
+
+    first, second = prompts
+    # Citation (f2) and high-priority (f1) win pass 1; low (f0) goes to pass 2
+    assert "Unique finding summary number 2" in first
+    assert "Unique finding summary number 1" in first
+    assert "Unique finding summary number 0" not in first
+    assert "Unique finding summary number 0" in second
+    assert result["final_report"].count("Merged body.") >= 1
+
+
+# ── Report: Suggested Follow-Up Questions ───────────────────────────
+
+
+def _seed_resolved_report_plan():
+    """Plan with one resolved question (plus raw result + finding) so the
+    report node has real content to work with."""
+    plan_id = create_plan("Follow-up report test", [])
+    create_questions(
+        plan_id, [{"question": "What is the core mechanism?", "priority": "high"}]
+    )
+    qid = f"q_{plan_id}_0"
+    set_question_in_progress(qid)
+    rid = store_raw_result(qid, plan_id, "q", "exa", "content", "Source A")
+    create_finding(
+        qid,
+        rid,
+        None,
+        [{"claim": "The mechanism behaves as specified.", "confidence": "high"}],
+        "The mechanism behaves as specified and is widely adopted.",
+        ["e2e"],
+    )
+    set_question_resolved(qid)
+    return plan_id
+
+
+def _run_report_node(plan_id, query, report_body, monkeypatch, tmp_path):
+    """Run _write_findings_node with a scripted LLM body and an isolated
+    data dir (the node writes a report file under paths_config.base_dir)."""
+    from config import settings
+    from config.settings import paths_config
+    from graph.workflow import _write_findings_node
+
+    monkeypatch.setattr(paths_config, "base_dir", str(tmp_path))
+
+    class ReportModel:
+        def invoke(self, prompt, **kwargs):
+            return type("R", (), {"content": report_body})()
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": ReportModel(),
+    )
+    return _write_findings_node({"plan_ref": plan_id, "original_query": query})[
+        "final_report"
+    ]
+
+
+def test_report_followup_backstop_appends_open_questions(monkeypatch, tmp_path):
+    """The LLM omits the 'Suggested Follow-Up Questions' section and the
+    bank has an open question → the node appends the open questions so
+    structured follow-ups are never silently lost."""
+    body = (
+        "# Follow-up report\n\n## Executive Summary\n\n"
+        "This report synthesizes the findings and deliberately omits the "
+        "follow-up section, which the deterministic backstop must restore "
+        "from the open rows in the question bank for this plan."
+    )
+    plan_id = _seed_resolved_report_plan()
+    add_question(plan_id, "How do the top tools handle non-ML users?")
+
+    report = _run_report_node(
+        plan_id, "What is the core mechanism?", body, monkeypatch, tmp_path
+    )
+
+    assert "## Suggested Follow-Up Questions" in report
+    assert "How do the top tools handle non-ML users?" in report
+
+
+def test_report_followup_section_from_llm_is_preserved(monkeypatch, tmp_path):
+    """When the LLM writes its own 'Suggested Follow-Up Questions' section,
+    the node must keep it verbatim and not append a duplicate backstop."""
+    body = (
+        "# Follow-up report\n\n## Executive Summary\n\n"
+        "Report body that already contains the follow-up section, which the "
+        "node must preserve and must not duplicate with a deterministic "
+        "backstop listing the bank rows."
+        "\n\n## Suggested Follow-Up Questions\n\n"
+        "- How does the mechanism scale to distributed settings?\n"
+    )
+    plan_id = _seed_resolved_report_plan()
+    add_question(plan_id, "An open bank row that must not be duplicated?")
+
+    report = _run_report_node(
+        plan_id, "What is the core mechanism?", body, monkeypatch, tmp_path
+    )
+
+    assert report.count("## Suggested Follow-Up Questions") == 1
+    assert "How does the mechanism scale to distributed settings?" in report
+
+
+def test_report_followup_backstop_does_not_fabricate(monkeypatch, tmp_path):
+    """The LLM omits the section AND the bank has no open questions → the
+    node must not invent a section (code never fabricates questions)."""
+    body = (
+        "# Follow-up report\n\n## Executive Summary\n\n"
+        "Report body with no follow-up section, and the question bank for "
+        "this plan has no open rows, so the node must not fabricate one."
+    )
+    plan_id = _seed_resolved_report_plan()
+
+    report = _run_report_node(
+        plan_id, "What is the core mechanism?", body, monkeypatch, tmp_path
+    )
+
+    assert "Suggested Follow-Up Questions" not in report
 
 
 # ── Extraction Node ─────────────────────────────────────────────────
@@ -1915,9 +2436,14 @@ def test_search_node_cached_result():
         qid = f"q_{plan_id}_0"
         set_question_in_progress(qid)
 
-        # Pre-populate cache with the composite key (query||engine||arxiv_flag)
+        # Pre-populate cache with the composite key
+        # (query||primary||arxiv_flag||arxiv_max_results||github_flag||github_max_results).
+        # "grpo" is a strong science term, so the routing plan sets arxiv=True
+        # for this query; it has no OSS vocabulary, so github=False.
+        q = "Unique cached query xyz about grpo training"
         store_cache(
-            "Unique cached query xyz about grpo training||exa||True",
+            f"{q}||exa||True||{search_config.arxiv_max_results}||False"
+            f"||{search_config.github_max_results}",
             [
                 {
                     "title": "Cached Result",
@@ -2025,6 +2551,45 @@ def test_workflow_state_declares_control_keys():
     assert expected <= keys
 
 
+# ── LLM progress logging (invoke_with_cost) ─────────────────────────
+#
+# Every LLM call prints a start line and a done/failed line (duration +
+# tokens) so a running session is checkable at a glance — silence used
+# to be indistinguishable from a hang on the slow local model.
+
+
+def test_invoke_with_cost_prints_progress_lines(capsys):
+    from utils.llm import invoke_with_cost
+
+    class Model:
+        model_name = "test-model"
+
+        def invoke(self, prompt):
+            return type("R", (), {"content": "ok"})()
+
+    invoke_with_cost(Model(), "hello", task="extraction")
+    out = capsys.readouterr().out
+    assert "[LLM] extraction (test-model): generating" in out
+    assert "[LLM] extraction done in" in out
+    assert "tokens)" in out
+
+
+def test_invoke_with_cost_prints_failure_line(capsys):
+    from utils.llm import invoke_with_cost
+
+    class Model:
+        model_name = "test-model"
+
+        def invoke(self, prompt):
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        invoke_with_cost(Model(), "hello", task="extraction")
+    out = capsys.readouterr().out
+    assert "[LLM] extraction FAILED" in out
+    assert "RuntimeError" in out
+
+
 # ── E2E: Full Graph Runs (scripted LLM, mocked search) ──────────────
 
 
@@ -2067,6 +2632,9 @@ class MockLLM:
             content = json.dumps(
                 {"ready": False, "gaps": ["needs more depth"], "confidence": "high"}
             )
+        elif "deduplicating a list of open research questions" in prompt:
+            # No duplicates in the E2E script — keep the bank intact.
+            content = json.dumps({"discard": []})
         elif "consistency checker" in prompt:
             content = "[]"
         elif "Generate recommendations for each raw entry" in prompt:
@@ -2319,6 +2887,380 @@ def test_deduplicate_preserves_distinct_questions():
     deduplicate_and_prioritize(plan_id)
     stats = get_plan_stats(plan_id)
     assert stats["pending"] == 3  # all distinct, none removed
+
+
+# ── LLM-assisted question dedup ─────────────────────────────────────
+#
+# Keyword Jaccard only catches near-verbatim paraphrases pending-to-
+# pending. _llm_dedup_open_questions() batches the open questions plus
+# the recently resolved ones into one LLM call and catches semantic
+# duplicates — including re-asks of just-resolved questions.
+
+
+def _patch_dedup_llm(monkeypatch, discard: list):
+    """Script config.get_chat_model so the dedup call returns `discard`."""
+    from config import settings
+
+    class DedupModel:
+        def invoke(self, prompt, **kwargs):
+            assert "deduplicating a list of open research questions" in prompt
+            return type("R", (), {"content": json.dumps({"discard": discard})})()
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": DedupModel(),
+    )
+
+
+def _two_open_questions(plan_id: str) -> tuple:
+    """Two open questions that pass the insert-time Jaccard guard."""
+    q1 = add_question(
+        plan_id,
+        "What is the performance of vLLM on A100 GPUs?",
+        discovered_by="user",
+    )
+    q2 = add_question(
+        plan_id,
+        "How fast is vLLM on A100 hardware?",
+        discovered_by="user",
+    )
+    return q1, q2
+
+
+def test_llm_dedup_discards_paraphrase_duplicate(monkeypatch):
+    from nodes.curation import _llm_dedup_open_questions
+
+    plan_id = create_plan("Test", [])
+    q1, q2 = _two_open_questions(plan_id)
+    _patch_dedup_llm(
+        monkeypatch,
+        [{"id": q2, "duplicate_of": q1, "reason": "asks the same thing"}],
+    )
+
+    result = _llm_dedup_open_questions(plan_id)
+
+    assert [d["id"] for d in result] == [q2]
+    assert result[0]["duplicate_of"] == q1
+    row = get_question(q2)
+    assert row["status"] == "discarded"
+    assert row["priority"] == "low"
+    assert row["discovered_by"] == "llm-dedup"
+    assert get_question(q1)["status"] == "pending"
+
+
+def test_llm_dedup_discards_re_ask_of_resolved_question(monkeypatch):
+    """The observed growth mode: an open question that re-asks one the
+    plan just resolved (anchored to a resolved id → whole component
+    discarded)."""
+    from nodes.curation import _llm_dedup_open_questions
+
+    plan_id = create_plan("Test", [])
+    q1, q2 = _two_open_questions(plan_id)
+    # A resolved question the plan already answered.
+    resolved_q = add_question(
+        plan_id,
+        "Which serving framework handles prefix caching best?",
+        discovered_by="user",
+    )
+    set_question_resolved(resolved_q)
+    _patch_dedup_llm(
+        monkeypatch,
+        [{"id": q2, "duplicate_of": resolved_q, "reason": "already answered"}],
+    )
+
+    result = _llm_dedup_open_questions(plan_id)
+
+    assert [d["id"] for d in result] == [q2]
+    assert get_question(resolved_q)["status"] == "resolved"  # untouched
+    assert get_question(q1)["status"] == "pending"
+
+
+def test_llm_dedup_mutual_flags_keep_best_member(monkeypatch):
+    """A group where the LLM flags every member against each other keeps
+    its best question (priority, then age) — never discards the group."""
+    from nodes.curation import _llm_dedup_open_questions
+
+    plan_id = create_plan("Test", [])
+    q1, q2 = _two_open_questions(plan_id)
+    update_question_priority(q1, "high")  # q1 beats q2 (medium)
+    _patch_dedup_llm(
+        monkeypatch,
+        [
+            {"id": q1, "duplicate_of": q2, "reason": "same"},
+            {"id": q2, "duplicate_of": q1, "reason": "same"},
+        ],
+    )
+
+    result = _llm_dedup_open_questions(plan_id)
+
+    assert [d["id"] for d in result] == [q2]
+    assert get_question(q1)["status"] == "pending"
+
+
+def test_llm_dedup_ignores_hallucinated_ids(monkeypatch):
+    from nodes.curation import _llm_dedup_open_questions
+
+    plan_id = create_plan("Test", [])
+    q1, q2 = _two_open_questions(plan_id)
+    _patch_dedup_llm(
+        monkeypatch,
+        [
+            {"id": "q_plan_fake_0000", "duplicate_of": q1, "reason": "ghost"},
+            {"id": q2, "duplicate_of": "q_plan_fake_0001", "reason": "ghost"},
+        ],
+    )
+
+    result = _llm_dedup_open_questions(plan_id)
+
+    assert result == []
+    assert get_plan_stats(plan_id)["pending"] == 2
+
+
+def test_llm_dedup_llm_failure_returns_empty(monkeypatch):
+    """Any failure (LLM down, bad JSON) → no changes, []."""
+    from config import settings
+    from nodes.curation import _llm_dedup_open_questions
+
+    plan_id = create_plan("Test", [])
+    _two_open_questions(plan_id)
+
+    class BrokenModel:
+        def invoke(self, prompt, **kwargs):
+            raise RuntimeError("llm down")
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": BrokenModel(),
+    )
+
+    assert _llm_dedup_open_questions(plan_id) == []
+    assert get_plan_stats(plan_id)["pending"] == 2
+
+
+def test_llm_dedup_skips_when_fewer_than_two_open(monkeypatch):
+    """No LLM call at all with <2 open questions (the model must never
+    be invoked — it would raise here if it were)."""
+    from config import settings
+    from nodes.curation import _llm_dedup_open_questions
+
+    plan_id = create_plan("Test", [])
+    add_question(plan_id, "A single open question?", discovered_by="user")
+
+    class NeverCallModel:
+        def invoke(self, prompt, **kwargs):
+            raise AssertionError("LLM must not be called with <2 open questions")
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": NeverCallModel(),
+    )
+
+    assert _llm_dedup_open_questions(plan_id) == []
+    assert get_plan_stats(plan_id)["pending"] == 1
+
+
+def test_prepare_review_payload_includes_llm_dedup(monkeypatch):
+    """prepare_review_node runs the dedup pass and surfaces its result in
+    the review payload (both the structured field and the prompt text)."""
+    from config import settings
+    from nodes.curation import prepare_review_node
+
+    plan_id = create_plan("Test", [])
+    q1, q2 = _two_open_questions(plan_id)
+
+    class DedupModel:
+        def invoke(self, prompt, **kwargs):
+            if "deduplicating a list of open research questions" in prompt:
+                content = json.dumps(
+                    {"discard": [{"id": q2, "duplicate_of": q1, "reason": "same"}]}
+                )
+            elif "consistency checker" in prompt:
+                content = "[]"
+            elif "Generate recommendations" in prompt:
+                content = "[]"
+            else:
+                raise AssertionError(f"Unexpected prompt: {prompt[:100]!r}")
+            return type("R", (), {"content": content})()
+
+    monkeypatch.setattr(
+        settings.LLMConfig,
+        "get_chat_model",
+        lambda self, model="", max_tokens=None, task="": DedupModel(),
+    )
+
+    payload = prepare_review_node({"plan_ref": plan_id, "iteration_count": 1})[
+        "_review_payload"
+    ]
+
+    assert [d["id"] for d in payload["llm_dedup"]] == [q2]
+    assert "LLM dedup" in payload["prompt"]
+    # Coverage is refreshed after the LLM dedup: q2 discarded -> 1 of 2
+    # closed, 1 open (q1, medium priority -> 0 high-priority). Without the
+    # refresh the line would be missing entirely (state had no _coverage).
+    assert (
+        "Question coverage: 1/2 closed (1 open, 0 high-priority)" in payload["prompt"]
+    )
+
+
+# ── Insert-time similarity guard (add_question) ───────────────────
+#
+# Session 4 of the OSS agent-eval run showed the pipeline re-asking
+# questions it had just resolved (7 of 12 new questions were paraphrase
+# duplicates). add_question() now suppresses near-duplicates for
+# automatic sources (Jaccard >= 0.4 vs any non-discarded plan
+# question, same rule as curation dedup). User-typed questions are
+# never suppressed.
+
+
+BASE_Q = "What standard agent evaluation metrics are commonly interpreted by non-technical users?"
+# Same keywords reordered + two added words -> Jaccard ~0.64 (suppressed).
+PARAPHRASE_Q = "Which standard agent evaluation metrics can non-technical users interpret without ML expertise?"
+# Shares only a few keywords with BASE_Q -> Jaccard ~0.28 (inserted).
+DISTINCT_Q = "How do agent evaluation libraries score trajectories when the final output is missing due to timeout or failure?"
+
+
+def test_add_question_guard_suppresses_auto_near_duplicate_of_open():
+    """Auto-source near-duplicate of an open question is not inserted."""
+    plan_id = create_plan("Test", [])
+    create_questions(plan_id, [{"question": BASE_Q, "priority": "high"}])
+
+    result = add_question(plan_id, PARAPHRASE_Q, discovered_by="extraction")
+
+    assert result is None
+    assert get_plan_stats(plan_id)["pending"] == 1
+
+
+def test_add_question_guard_inserts_distinct_auto_question():
+    """Auto question below the similarity threshold is inserted."""
+    plan_id = create_plan("Test", [])
+    create_questions(plan_id, [{"question": BASE_Q, "priority": "high"}])
+
+    result = add_question(plan_id, DISTINCT_Q, discovered_by="extraction")
+
+    assert result is not None
+    assert get_plan_stats(plan_id)["pending"] == 2
+
+
+def test_add_question_guard_counts_resolved_questions():
+    """Re-asking a resolved question is suppressed (the observed growth mode)."""
+    plan_id = create_plan("Test", [])
+    create_questions(plan_id, [{"question": BASE_Q, "priority": "high"}])
+    q = get_pending_question(plan_id)
+    set_question_resolved(q["id"])
+
+    result = add_question(plan_id, PARAPHRASE_Q, discovered_by="dod_gaps")
+
+    assert result is None
+    assert get_plan_stats(plan_id).get("pending", 0) == 0
+
+
+def test_add_question_guard_never_suppresses_user_questions():
+    """User-typed questions bypass the guard even when near-duplicate."""
+    plan_id = create_plan("Test", [])
+    create_questions(plan_id, [{"question": BASE_Q, "priority": "high"}])
+
+    result = add_question(plan_id, PARAPHRASE_Q, discovered_by="user")
+
+    assert result is not None
+    assert get_plan_stats(plan_id)["pending"] == 2
+
+
+def test_add_question_guard_ignores_discarded_questions():
+    """A discarded near-duplicate does not block a new question."""
+    plan_id = create_plan("Test", [])
+    create_questions(plan_id, [{"question": BASE_Q, "priority": "high"}])
+    q = get_pending_question(plan_id)
+    set_question_discarded(q["id"])
+
+    result = add_question(plan_id, PARAPHRASE_Q, discovered_by="extraction")
+
+    assert result is not None
+    assert get_plan_stats(plan_id)["pending"] == 1
+
+
+# ── Topic clustering (cluster_plan_questions) ─────────────────────
+#
+# Gives the question bank a readable topic structure (run.py topics).
+# Deterministic keyword clustering — no LLM, no network.
+
+
+def test_cluster_groups_similar_questions():
+    """Two topical pairs cluster separately from each other."""
+    plan_id = create_plan("Test", [])
+    create_questions(
+        plan_id,
+        [
+            {
+                "question": "What are the latency trade-offs of continuous batching in vLLM?",
+                "priority": "high",
+            },
+            {
+                "question": "What latency trade-offs does SGLang continuous batching have?",
+                "priority": "medium",
+            },
+            {
+                "question": "How does TensorRT-LLM handle KV cache memory limits?",
+                "priority": "medium",
+            },
+            {
+                "question": "What KV cache memory limits does TGI enforce?",
+                "priority": "low",
+            },
+        ],
+    )
+    clusters = cluster_plan_questions(plan_id)
+    assert len(clusters) == 2
+    texts = [[m["question"] for m in c["members"]] for c in clusters]
+    assert any(len(t) == 2 and all("batching" in q for q in t) for t in texts)
+    assert any(len(t) == 2 and all("cache" in q for q in t) for t in texts)
+    # label is always one of the cluster's members
+    for c in clusters:
+        assert c["label"] in [m["question"] for m in c["members"]]
+        assert sum(c["counts"].values()) == len(c["members"])
+
+
+def test_cluster_excludes_discarded_questions():
+    """Discarded questions do not appear in any cluster."""
+    plan_id = create_plan("Test", [])
+    create_questions(
+        plan_id,
+        [
+            {
+                "question": "What are the latency trade-offs of continuous batching in vLLM?"
+            },
+            {"question": "What KV cache memory limits does TGI enforce?"},
+        ],
+    )
+    q = get_pending_question(plan_id)
+    set_question_discarded(q["id"])
+
+    clusters = cluster_plan_questions(plan_id)
+
+    assert sum(len(c["members"]) for c in clusters) == 1
+
+
+def test_cluster_is_deterministic_and_empty_plan():
+    """Same bank → same labels; an empty plan yields no clusters."""
+    plan_id = create_plan("Test", [])
+    assert cluster_plan_questions(plan_id) == []
+    create_questions(
+        plan_id,
+        [
+            {
+                "question": "What are the latency trade-offs of continuous batching in vLLM?"
+            },
+            {
+                "question": "What latency trade-offs does SGLang continuous batching have?"
+            },
+            {"question": "What KV cache memory limits does TGI enforce?"},
+        ],
+    )
+    first = cluster_plan_questions(plan_id)
+    second = cluster_plan_questions(plan_id)
+    assert [c["label"] for c in first] == [c["label"] for c in second]
 
 
 # ── Quality Gate (Phase A: "No Evidence Found") ──────────────────

@@ -13,9 +13,9 @@ from typing import Dict, List, Optional
 from .engine import get_db, _now, _row_to_dict, _serialize
 
 try:
-    from ..config.settings import paths_config
+    from ..config.settings import paths_config, search_config
 except ImportError:
-    from config.settings import paths_config
+    from config.settings import paths_config, search_config
 
 
 # ── Plan operations ──────────────────────────────────────────────────
@@ -173,6 +173,21 @@ def set_question_pending(question_id: str) -> None:
         )
 
 
+def set_question_discarded(question_id: str) -> None:
+    """Mark a question discarded (terminal) and clear its error.
+
+    Used by the backlog browser's 'drop' command — the user decided this
+    question is not worth researching. Mirrors the dedup behavior in
+    deduplicate_and_prioritize() (status='discarded', priority='low').
+    """
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE questions SET status = 'discarded', priority = 'low', "
+            "last_error = NULL WHERE id = ?",
+            (question_id,),
+        )
+
+
 def reset_stale_in_progress(plan_id: str) -> None:
     """Reset in_progress questions back to pending (self-heal after a crash).
 
@@ -191,12 +206,78 @@ def reset_stale_in_progress(plan_id: str) -> None:
         )
 
 
-def add_question(plan_id: str, question: str, discovered_by: str = "extraction") -> str:
+# ── Question similarity helpers ──────────────────────────────────────
+# Shared by the insert-time guard in add_question() and the curation-time
+# dedup in deduplicate_and_prioritize(): one keyword/similarity
+# implementation so the two can't drift apart. STOP_WORDS (defined below)
+# is resolved at call time.
+
+
+def _normalize_question_word(w: str) -> str:
+    """Normalize a word: lowercase, strip punctuation, remove hyphens, drop trailing 's'."""
+    w = w.strip("?.!,;:\"'").replace("-", "").replace("_", "").lower()
+    # Simple plural handling: drop trailing 's' (not for 'ss' words)
+    if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
+        w = w[:-1]
+    return w
+
+
+def _question_keywords(text: str) -> set:
+    """Normalized keyword set for a question (stop words removed)."""
+    return {
+        _normalize_question_word(w)
+        for w in text.lower().split()
+        if _normalize_question_word(w) not in STOP_WORDS
+    }
+
+
+def _question_similarity(a: set, b: set) -> float:
+    """Jaccard similarity between two keyword sets."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+# Sources that add questions automatically (the pipeline, not a human).
+# add_question() suppresses near-duplicates for these so the backlog
+# cannot grow unboundedly with paraphrased re-asks of questions the plan
+# already asked or resolved. User-typed sources ("user", "gap_command")
+# are never suppressed — a human explicitly asked for the question.
+_AUTO_QUESTION_SOURCES = {"extraction", "dod_gaps", "contradiction_resolution"}
+
+
+def add_question(
+    plan_id: str, question: str, discovered_by: str = "extraction"
+) -> Optional[str]:
     """Add a new question to the bank.
 
     Uses a uuid4 suffix so dynamically added questions can never collide
     with the index-based IDs created by create_questions().
+
+    Returns the new question ID, or None when nothing is inserted: the
+    question is empty/non-string, or (for automatic sources only) it is a
+    near-duplicate (Jaccard >= 0.4 — the same rule as curation dedup) of
+    any non-discarded question already in the plan's bank.
+    Resolved questions count: re-asking a question the plan just resolved
+    is the observed backlog-growth mode (see
+    RESEARCH_LOOP_IMPROVEMENTS.md §3).
     """
+    if not isinstance(question, str) or not question.strip():
+        return None
+    if discovered_by in _AUTO_QUESTION_SOURCES:
+        new_kw = _question_keywords(question)
+        if new_kw:
+            with get_db() as conn:
+                rows = conn.execute(
+                    "SELECT question FROM questions "
+                    "WHERE plan_id = ? AND status != 'discarded'",
+                    (plan_id,),
+                ).fetchall()
+            if any(
+                _question_similarity(new_kw, _question_keywords(row["question"])) >= 0.4
+                for row in rows
+            ):
+                return None
     qid = f"q_{plan_id}_{uuid.uuid4().hex[:8]}"
     with get_db() as conn:
         conn.execute(
@@ -234,40 +315,18 @@ def deduplicate_and_prioritize(plan_id: str) -> None:
     if len(rows) < 2:
         return  # nothing to dedup
 
-    # Stop words: the shared module-level STOP_WORDS (defined below,
-    # resolved at call time) — one list for all keyword extraction, so
-    # question dedup and plan-similarity can't drift apart.
-
-    def normalize_word(w: str) -> str:
-        """Normalize a word: lowercase, strip punctuation, remove hyphens, drop trailing 's'."""
-        w = w.strip("?.!,;:\"'").replace("-", "").replace("_", "").lower()
-        # Simple plural handling: drop trailing 's' (not for 'ss' words)
-        if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
-            w = w[:-1]
-        return w
-
-    def keywords(text: str) -> set:
-        return {
-            normalize_word(w)
-            for w in text.lower().split()
-            if normalize_word(w) not in STOP_WORDS
-        }
-
-    def similarity(a: set, b: set) -> float:
-        """Jaccard similarity between two keyword sets."""
-        if not a or not b:
-            return 0.0
-        return len(a & b) / len(a | b)
-
-    # Group questions by word-overlap similarity.
+    # Group questions by word-overlap similarity, using the shared
+    # helpers above (_question_keywords/_question_similarity — also used
+    # by the insert-time guard in add_question(), so curation-time and
+    # insert-time dedup apply the same rule).
     # Precompute keyword sets to avoid O(n²·m) recomputation.
     groups: list[tuple[list, list[set]]] = []  # (question_list, keyword_set_list)
     for row in rows:
-        kw = keywords(row["question"])
+        kw = _question_keywords(row["question"])
         merged = False
         for group_qs, group_kws in groups:
             # Check similarity against all precomputed members of this group
-            if any(similarity(kw, gkw) >= 0.4 for gkw in group_kws):
+            if any(_question_similarity(kw, gkw) >= 0.4 for gkw in group_kws):
                 group_qs.append(dict(row))
                 group_kws.append(kw)
                 merged = True
@@ -303,6 +362,54 @@ def deduplicate_and_prioritize(plan_id: str) -> None:
                 )
 
 
+def cluster_plan_questions(plan_id: str, threshold: float = 0.25) -> List[Dict]:
+    """Group a plan's non-discarded questions into topic clusters.
+
+    Deterministic greedy anchor-only (star) clustering: questions are
+    processed in created_at order; each joins the first existing cluster
+    whose anchor — the cluster's first/oldest member, i.e. the label —
+    has Jaccard similarity >= threshold (the same keyword helpers as the
+    dedup paths), otherwise it starts a new cluster. Anchor-only instead
+    of single-linkage on purpose: shared "agent evaluation" vocabulary
+    makes single-linkage chain loosely related questions into one blob.
+
+    Gives the question bank — and, via question_id, the findings
+    attached to it — a readable topic structure (see `run.py topics`).
+    Read-only: never mutates the DB.
+
+    Returns a list of clusters:
+        {"label": str,       # question text of the oldest member
+         "members": [dict],  # question rows, created_at order
+         "counts": {status: n}}
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM questions WHERE plan_id = ? AND status != 'discarded' "
+            "ORDER BY created_at, id",
+            (plan_id,),
+        ).fetchall()
+
+    clusters: list[Dict] = []
+    anchor_kws: list[set] = []
+    for row in rows:
+        q = dict(row)
+        kw = _question_keywords(q["question"])
+        for cluster, anchor_kw in zip(clusters, anchor_kws):
+            if _question_similarity(kw, anchor_kw) >= threshold:
+                cluster["members"].append(q)
+                break
+        else:
+            clusters.append({"label": q["question"], "members": [q], "counts": {}})
+            anchor_kws.append(kw)
+
+    for cluster in clusters:
+        counts: dict[str, int] = {}
+        for m in cluster["members"]:
+            counts[m["status"]] = counts.get(m["status"], 0) + 1
+        cluster["counts"] = counts
+    return clusters
+
+
 def all_questions_are_resolved(plan_id: str) -> bool:
     """Check if all questions in a plan are in a terminal state.
 
@@ -322,12 +429,26 @@ def all_questions_are_resolved(plan_id: str) -> bool:
 
 
 def cache_check(query_hash: str) -> Optional[dict]:
-    """Check if a query hash exists in the cache."""
+    """Check if a query hash exists in the cache and is still fresh.
+
+    Freshness is governed by search_config.cache_ttl_days (env
+    SEARCH_CACHE_TTL_DAYS, default 30): entries older than the TTL are
+    treated as misses so fast-moving topics re-search instead of serving
+    stale results. A TTL of 0 disables expiration entirely.
+    """
+    ttl = search_config.cache_ttl_days
     with get_db() as conn:
-        row = conn.execute(
-            "SELECT * FROM search_cache WHERE query_hash = ? AND cached_at > datetime('now', '-7 days')",
-            (query_hash,),
-        ).fetchone()
+        if ttl > 0:
+            row = conn.execute(
+                "SELECT * FROM search_cache WHERE query_hash = ? "
+                "AND cached_at > datetime('now', ?)",
+                (query_hash, f"-{ttl} days"),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM search_cache WHERE query_hash = ?",
+                (query_hash,),
+            ).fetchone()
     return _row_to_dict(row) if row else None
 
 
@@ -682,6 +803,12 @@ STOP_WORDS = {
     "do",
     "does",
     "did",
+    # Interrogative filler — "What do we still need to know about X" must
+    # not make two such questions look similar to each other.
+    "we",
+    "still",
+    "need",
+    "know",
     "the",
     "a",
     "an",

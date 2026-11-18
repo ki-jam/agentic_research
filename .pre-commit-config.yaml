@@ -12,7 +12,8 @@ repos:
     hooks:
       - id: pytest
         name: pytest
-        entry: ../venv/bin/python -m pytest tests/ -q --tb=short
+        # Uses the `python` on your PATH — activate your venv before committing.
+        entry: python -m pytest tests/ -q --tb=short
         language: system
         pass_filenames: false
         always_run: true

@@ -13,6 +13,8 @@ The consolidation node sets _route which the router reads.
 
 from __future__ import annotations
 
+import re
+
 from config.prompts import REPORT_SYSTEM
 from config.settings import config, workflow_config
 
@@ -320,7 +322,7 @@ def consolidation_node(state) -> dict:
                 if gap_kw & existing_kw:
                     continue  # similar question already exists
 
-                add_question(plan_id, gap.strip(), discovered_by="dod_gaps")
+                add_question(plan_id, _gap_to_question(gap), discovered_by="dod_gaps")
                 added += 1
                 # Track new keywords to avoid adding similar gaps in same pass
                 for w in gap.strip().lower().split():
@@ -348,6 +350,54 @@ def consolidation_node(state) -> dict:
 
 
 # ── Enforcement helpers ────────────────────────────────────────────
+
+# Gap statements that the readiness LLM emits ("Missing TGI performance
+# details", "No head-to-head benchmarks") are not questions — but the
+# backlog treats everything in the bank as a question, and the search
+# node feeds the text straight into a search query.
+_GAP_STATEMENT_PREFIXES = (
+    "missing",
+    "lacking",
+    "lacks",
+    "lack of",
+    "no coverage of",
+    "no details on",
+    "no information on",
+    "no information about",
+    "not covered",
+    "no ",
+)
+
+
+def _gap_to_question(gap: str) -> str:
+    """Turn a DoD gap statement into a researchable question.
+
+    Questions (ending in '?') and plain noun phrases ("API compatibility
+    and integrations") pass through unchanged — they already read as
+    questions/search queries. Statements that merely assert what is
+    missing ("Missing X details.") get wrapped so the bank holds an
+    actual question instead of a gap description.
+    """
+    text = gap.strip()
+    # Question check BEFORE rstrip: rstrip(".!?") would eat the "?" and
+    # turn "How does X work?" into a statement-shaped "How does X work".
+    if text.endswith("?"):
+        return text
+    text = text.rstrip(".!?")
+    if not text:
+        return gap.strip()
+    lowered = text.lower()
+    for prefix in _GAP_STATEMENT_PREFIXES:
+        if lowered.startswith(prefix):
+            rest = text[len(prefix) :].strip()
+            rest = re.sub(r"^(?:the|a|an)\s+", "", rest, flags=re.IGNORECASE).strip()
+            if rest:
+                # Keep rest's capitalization as-is: gaps name acronyms and
+                # camelCase products ("TGI", "TensorFlow") that a blind
+                # first-letter lowercase would corrupt.
+                return f"What do we still need to know about {rest}?"
+            break
+    return text
 
 
 def _question_coverage(plan_id: str) -> dict:
